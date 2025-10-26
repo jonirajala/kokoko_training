@@ -8,6 +8,7 @@ import torch
 import time
 import logging
 import gc
+import psutil
 from typing import Dict, Any, Optional
 from dataclasses import dataclass
 from enum import Enum

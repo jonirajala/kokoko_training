@@ -52,7 +52,7 @@ class EnglishTrainer(KokoroTrainer):
         import torch
         if self.use_mixed_precision:
             if self.device.type == DeviceType.CUDA.value:
-                self.scaler = torch.cuda.amp.GradScaler('cuda')
+                self.scaler = torch.cuda.amp.GradScaler()
                 self.device_type = 'cuda'
                 logger.info("Mixed precision training enabled with CUDA GradScaler")
             elif self.device.type == DeviceType.MPS.value:
