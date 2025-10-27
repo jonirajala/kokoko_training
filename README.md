@@ -1,64 +1,46 @@
 # Kokoro English TTS
 
-A Text-to-Speech (TTS) training implementation for English using the Kokoro Transformer architecture with LJSpeech dataset support.
+Training implementation for English text-to-speech using the Kokoro Transformer architecture with LJSpeech dataset support.
+
+## Current State
+
+This is a simplified training implementation based on the Kokoro architecture. It differs from the official Kokoro-82M model in several ways: uses explicit duration prediction instead of monotonic alignment search, employs teacher forcing during training rather than guided attention, has a simpler architecture (no style tokens or multi-speaker embedding), and uses standard transformer blocks without the production optimizations found in the released model. This implementation prioritizes training clarity and educational value over matching the exact production architecture.
 
 ## Features
 
-- **Modern Transformer Architecture**: Full encoder-decoder with multi-head attention
-- **Montreal Forced Aligner (MFA)**: Phoneme-level duration alignment for high-quality synthesis
-- **GPU Optimized**: CUDA support with optional mixed precision training
-- **Weights & Biases**: Built-in experiment tracking and monitoring
-- **Checkpoint Management**: Resume training from any saved checkpoint
-- **Memory Efficient**: Adaptive memory management and gradient checkpointing
+Full encoder-decoder transformer with multi-head attention, phoneme-level duration alignment using Montreal Forced Aligner (MFA), CUDA support with optional mixed precision training, experiment tracking via Weights & Biases, checkpoint management for resuming training, and adaptive memory management with gradient checkpointing.
 
 ## Quick Start
 
-### 1. Installation
-
+Install dependencies:
 ```bash
-# Install dependencies
 pip install -r requirements.txt
-
-# Install Misaki for English G2P
 pip install "misaki[en]"
 ```
 
-### 2. Download LJSpeech Dataset
-
+Download LJSpeech dataset with pre-aligned MFA annotations (3.8GB, recommended):
 ```bash
-# Download with pre-aligned MFA annotations (recommended - 3.8GB)
 python setup_ljspeech.py --zenodo
+```
 
-# Or download original and align yourself (2.6GB + 1-3 hours alignment)
+Or download and align yourself (2.6GB + 1-3 hours):
+```bash
 python setup_ljspeech.py
 python setup_ljspeech.py --align
 ```
 
-### 3. Start Training
-
+Start training:
 ```bash
-# Basic training
 python training_english.py --corpus LJSpeech-1.1 --wandb
-
-# Full configuration
-python training_english.py \
-  --corpus LJSpeech-1.1 \
-  --output kokoro_english_model \
-  --batch-size 16 \
-  --epochs 100 \
-  --wandb
-
-# Resume from checkpoint
-python training_english.py \
-  --corpus LJSpeech-1.1 \
-  --resume auto \
-  --wandb
 ```
 
-### 4. Generate Speech
-
+Resume from checkpoint:
 ```bash
-# Run inference
+python training_english.py --corpus LJSpeech-1.1 --resume auto --wandb
+```
+
+Generate speech:
+```bash
 python inference_english.py \
   --model kokoro_english_model/kokoro_english_final.pth \
   --text "Hello world, this is a test." \
@@ -81,23 +63,9 @@ python inference_english.py \
 
 ## Model Architecture
 
-### Core Components
+The model consists of a text encoder (6-layer transformer with 8 attention heads), duration predictor (MLP for phoneme durations), length regulator (expands encoder outputs), mel decoder (6-layer transformer with masked attention), and stop token predictor.
 
-- **Text Encoder**: 6-layer Transformer encoder with 8 attention heads
-- **Duration Predictor**: MLP predicting phoneme durations
-- **Length Regulator**: Expands encoder outputs based on predicted durations
-- **Mel Decoder**: 6-layer Transformer decoder with masked attention
-- **Stop Token Predictor**: Predicts end-of-sequence
-
-### Configuration
-
-- **Hidden Dimension**: 512
-- **Encoder/Decoder Layers**: 6 each
-- **Attention Heads**: 8
-- **Feed-Forward Dimension**: 2048
-- **Mel Channels**: 80
-- **Sample Rate**: 22,050 Hz
-- **Gradient Checkpointing**: Enabled for memory efficiency
+Configuration: 512 hidden dimensions, 6 encoder/decoder layers, 8 attention heads, 2048 feed-forward dimensions, 80 mel channels, 22,050 Hz sample rate. Gradient checkpointing enabled for memory efficiency.
 
 ## Dataset Structure
 
@@ -116,17 +84,13 @@ LJSpeech-1.1/
 
 ## Cloud Training (Paperspace/Colab)
 
-### Setup on Paperspace
-
+Setup on Paperspace:
 ```bash
-# Navigate to persistent storage
 cd /storage
 
-# Download dataset directly on cloud
 wget https://zenodo.org/records/7499098/files/LJSpeech-1.1.tar.bz2
 tar -xjf LJSpeech-1.1.tar.bz2
 
-# Install dependencies
 pip install -r requirements.txt
 pip uninstall -y spacy-curated-transformers
 pip install transformers==4.35.2
@@ -134,10 +98,8 @@ pip install "numpy<2"
 pip install "misaki[en]"
 pip install --upgrade typing-extensions
 
-# Login to W&B
 wandb login
 
-# Start training
 python training_english.py \
   --corpus /storage/LJSpeech-1.1 \
   --output /storage/kokoro_english_model \
@@ -146,76 +108,54 @@ python training_english.py \
   --wandb
 ```
 
-### Performance Expectations
-
-- **P4000 GPU (8GB)**: ~38 minutes per epoch, batch size 16
-- **Expected Training**: 100 epochs = ~63 hours
-- **Checkpoints**: Saved every 5 epochs (~200MB each)
+P4000 GPU (8GB) takes about 38 minutes per epoch with batch size 16. Full training (100 epochs) takes around 63 hours. Checkpoints are saved every 5 epochs at ~200MB each.
 
 ## Monitoring with Weights & Biases
 
-When training with `--wandb`, you'll see:
-
-- **Loss curves**: Total, mel, duration, stop token losses
-- **Learning rate**: Schedule over time
-- **System metrics**: GPU utilization, memory, temperature
-- **Memory management**: Cleanup frequency, pressure levels
-
-Charts update every 10 batches for smooth visualization.
+Training with `--wandb` logs loss curves (total, mel, duration, stop token), learning rate schedule, system metrics (GPU utilization, memory, temperature), and memory management stats (cleanup frequency, pressure levels). Charts update every 10 batches.
 
 ## Inference
 
-### Basic Inference
-
+Basic usage:
 ```python
 from inference_english import EnglishTTSInference
 
-# Load model
 tts = EnglishTTSInference(
     model_path="kokoro_english_model/kokoro_english_final.pth",
     device="cuda"
 )
 
-# Generate speech
 tts.synthesize_to_file(
     text="Hello, how are you today?",
     output_path="output.wav"
 )
 ```
 
-### Advanced Options
-
+Advanced options:
 ```bash
 python inference_english.py \
   --model kokoro_english_model/checkpoint_epoch_50.pth \
   --text "Your text here" \
   --output output.wav \
   --device cuda \
-  --vocoder hifigan  # or 'griffin-lim'
+  --vocoder hifigan
 ```
 
 ## Troubleshooting
 
-### Common Issues
+`ImportError: cannot import name 'TypeIs' from 'typing_extensions'`
+Run `pip install --upgrade typing-extensions`
 
-**Problem**: `ImportError: cannot import name 'TypeIs' from 'typing_extensions'`
-**Solution**: `pip install --upgrade typing-extensions`
+Mixed precision errors on CUDA
+Add `--no-mixed-precision` flag
 
-**Problem**: Mixed precision errors on CUDA
-**Solution**: Add `--no-mixed-precision` flag
+Out of memory
+Reduce `--batch-size` (try 8, 4, or 2)
 
-**Problem**: Out of memory
-**Solution**: Reduce `--batch-size` (try 8, 4, or 2)
+W&B not showing loss charts
+Fixed in latest version (losses log every 10 batches)
 
-**Problem**: W&B not showing loss charts
-**Solution**: This was fixed in the latest version - losses now log every 10 batches
-
-### Performance Tips
-
-- **GPU Training**: Use batch size 16-32 for CUDA GPUs
-- **CPU Training**: Not recommended, use batch size 2-4 if necessary
-- **Memory**: Gradient checkpointing is enabled by default
-- **Dataset**: Pre-aligned Zenodo version saves 1-3 hours of setup time
+Performance tips: Use batch size 16-32 for CUDA GPUs. CPU training not recommended, but if needed use batch size 2-4. Gradient checkpointing is enabled by default. Pre-aligned Zenodo dataset saves 1-3 hours of setup.
 
 ## File Structure
 
@@ -270,34 +210,19 @@ See `requirements.txt` for full list.
 
 ## Testing
 
+Run implementation tests:
 ```bash
-# Run implementation tests
 python test_english_implementation.py
+```
 
-# Quick training test (100 samples)
+Quick training test (100 samples):
+```bash
 python training_english.py --test-mode
 ```
 
 ## Model Outputs
 
-Training generates:
-
-```
-kokoro_english_model/
-├── checkpoint_epoch_5.pth       # Regular checkpoints
-├── checkpoint_epoch_10.pth
-├── ...
-├── phoneme_processor.pkl        # English phoneme processor
-└── kokoro_english_final.pth     # Final trained model
-```
-
-Each checkpoint contains:
-- Model state dict
-- Optimizer state
-- Learning rate scheduler state
-- Training configuration
-- Current epoch and loss
-- Mixed precision scaler state
+Training generates checkpoints every 5 epochs, a phoneme processor file, and a final model. Each checkpoint contains model state dict, optimizer state, learning rate scheduler state, training configuration, current epoch and loss, and mixed precision scaler state.
 
 ## License
 
@@ -305,12 +230,4 @@ This implementation is for educational and research purposes.
 
 ## Acknowledgments
 
-- **Kokoro Architecture**: Based on the original Kokoro TTS model
-- **LJSpeech Dataset**: Public domain speech corpus by Keith Ito
-- **Montreal Forced Aligner**: For phoneme-level alignments
-- **Misaki**: English grapheme-to-phoneme conversion
-- **Credits**: Original implementation based on [kokoro-ruslan](https://github.com/igorshmukler/kokoro-ruslan)
-
-## Contributing
-
-Contributions welcome! Please open an issue or PR.
+Based on the original Kokoro TTS model. LJSpeech dataset by Keith Ito. Montreal Forced Aligner for phoneme-level alignments. Misaki for English G2P. Original implementation based on [kokoro-ruslan](https://github.com/igorshmukler/kokoro-ruslan).

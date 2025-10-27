@@ -1,191 +1,38 @@
 # Training Infrastructure
 
-This folder contains all training-related components including trainers, configuration, checkpointing, and optimization utilities.
+Training components including trainers, configuration, checkpointing, and optimization utilities.
 
 ## Files
 
-### `config_english.py` (Configuration)
-**Purpose**: Training configuration dataclass
-**Key Functions**:
-- `EnglishTrainingConfig` - Main config dataclass
-- `get_default_config()` - Standard configuration
-- `get_small_config()` - Smaller model for testing
+`config_english.py` provides training configuration dataclass. Functions: `get_default_config()` for standard setup, `get_small_config()` for testing. Configuration covers data paths/batch size/workers, model architecture dimensions, training parameters (learning rate, epochs, optimizer), audio settings (sample rate, mel parameters), hardware (device, mixed precision, memory), and logging (W&B, checkpoints, profiling).
 
-**Configuration Categories**:
-1. **Data**: Paths, batch size, workers
-2. **Model**: Architecture dimensions
-3. **Training**: Learning rate, epochs, optimizer
-4. **Audio**: Sample rate, mel parameters
-5. **Hardware**: Device, mixed precision, memory
-6. **Logging**: W&B, checkpoints, profiling
+`trainer.py` contains core training loop with profiling and memory management. Features automatic checkpoint resumption, learning rate scheduling (CosineAnnealingWarmRestarts), gradient clipping (norm=1.0), OOM recovery, and periodic memory cleanup. Supports mixed precision for both CUDA and MPS.
 
-### `trainer.py` (Base Trainer)
-**Purpose**: Core training loop with profiling and memory management
-**Key Components**:
-- `KokoroTrainer` - Base trainer class
-- Training loop with progress bars
-- Mixed precision support (CUDA/MPS)
-- Adaptive memory management
-- Profiling and benchmarking
+`english_trainer.py` extends base trainer for English TTS with W&B logging. Adds per-batch logging (every 10 batches), epoch summary metrics, memory/mixed precision tracking, smooth loss curves. Logs batch losses (total, mel, duration, stop), learning rate schedule, gradient scale, memory pressure, and throughput.
 
-**Features**:
-- Automatic checkpoint resumption
-- Learning rate scheduling (CosineAnnealingWarmRestarts)
-- Gradient clipping (norm=1.0)
-- OOM recovery
-- Periodic memory cleanup
+`checkpoint_manager.py` handles saving and loading model checkpoints. Functions: `save_checkpoint()`, `load_checkpoint()`, `save_phoneme_processor()`, `find_latest_checkpoint()`. Checkpoints contain epoch, model state dict, optimizer state, scheduler state, loss, config, and mixed precision scaler state.
 
-### `english_trainer.py` (English Trainer)
-**Purpose**: Extends base trainer for English TTS with W&B logging
-**Additions**:
-- Per-batch W&B logging (every 10 batches)
-- Epoch summary metrics
-- Memory and mixed precision tracking
-- Smooth loss curves in W&B dashboard
+`adaptive_memory_manager.py` provides intelligent memory cleanup based on pressure. Monitors usage every batch, triggers cleanup when pressure high, tracks overhead, handles emergency cleanup on OOM. Device-aware with different strategies for CUDA vs MPS. CUDA thresholds: low < 60%, moderate 60-75%, high 75-85%, critical > 85%.
 
-**W&B Metrics**:
-- Batch losses (total, mel, duration, stop)
-- Learning rate schedule
-- Gradient scale (mixed precision)
-- Memory pressure
-- Throughput (samples/sec)
+`interbatch_profiler.py` measures time spent between batches. Tracks data loading time, forward pass time, backward pass time, interbatch gap, and throughput. Used to identify bottlenecks in training pipeline.
 
-### `checkpoint_manager.py` (Checkpointing)
-**Purpose**: Save and load model checkpoints
-**Key Functions**:
-- `save_checkpoint()` - Save training state
-- `load_checkpoint()` - Resume from checkpoint
-- `save_phoneme_processor()` - Save vocab
-- `find_latest_checkpoint()` - Auto-resume
+`mps_grad_scaler.py` provides custom gradient scaler for Apple Silicon since PyTorch's built-in scaler is CUDA-only. Features loss scaling for FP16 training, overflow detection, dynamic scale adjustment.
 
-**Checkpoint Contents**:
-```python
-{
-    'epoch': int,
-    'model_state_dict': OrderedDict,
-    'optimizer_state_dict': dict,
-    'scheduler_state_dict': dict,
-    'loss': float,
-    'config': TrainingConfig,
-    'scaler': dict  # Mixed precision state
-}
-```
-
-### `adaptive_memory_manager.py` (Memory Optimization)
-**Purpose**: Intelligent memory cleanup based on pressure
-**Key Components**:
-- `MemoryPressureLevel` - Low/Moderate/High/Critical
-- `AdaptiveMemoryManager` - Cleanup coordinator
-- Device-specific thresholds (CUDA vs MPS)
-
-**Features**:
-- Monitors memory usage every batch
-- Triggers cleanup when pressure high
-- Tracks cleanup overhead
-- Emergency cleanup on OOM
-- Device-aware (CUDA/MPS different strategies)
-
-**Thresholds (CUDA)**:
-- Low: < 60% used
-- Moderate: 60-75% used
-- High: 75-85% used
-- Critical: > 85% used
-
-### `interbatch_profiler.py` (Performance Profiling)
-**Purpose**: Measure time spent between batches
-**Metrics**:
-- Data loading time
-- Forward pass time
-- Backward pass time
-- Interbatch gap (waiting time)
-- Throughput (samples/sec)
-
-**Use Case**: Identify bottlenecks in training pipeline
-
-### `mps_grad_scaler.py` (MPS Mixed Precision)
-**Purpose**: Custom gradient scaler for Apple Silicon (MPS)
-**Why Needed**: PyTorch's built-in scaler is CUDA-only
-**Features**:
-- Loss scaling for FP16 training
-- Overflow detection
-- Dynamic scale adjustment
-- Compatible with MPS backend
-
-### `device_type.py` (Device Enumeration)
-**Purpose**: Simple enum for device types
-**Values**: `CUDA`, `MPS`, `CPU`
+`device_type.py` contains simple enum for device types: CUDA, MPS, CPU.
 
 ## Training Flow
 
-### Initialization:
-```python
-1. Load config
-2. Create dataset & dataloader
-3. Initialize model
-4. Setup optimizer & scheduler
-5. Load checkpoint (if resuming)
-6. Initialize W&B (if enabled)
-```
+Initialization: load config, create dataset/dataloader, initialize model, setup optimizer/scheduler, load checkpoint if resuming, initialize W&B if enabled.
 
-### Training Loop:
-```python
-for epoch in range(start_epoch, num_epochs):
-    for batch in dataloader:
-        # 1. Adaptive memory check
-        cleanup_result = memory_manager.adaptive_cleanup(batch_idx)
+Training loop for each batch: adaptive memory check, load data to device, forward pass with mixed precision autocast, backward pass with scaler, optimizer step with gradient clipping (max_norm=1.0), log to W&B every 10 batches. Epoch end: scheduler step, save checkpoint, log epoch summary to W&B.
 
-        # 2. Load data to device
-        mel_specs, phonemes, durations = batch
+## Configuration
 
-        # 3. Forward pass (with mixed precision)
-        with autocast():
-            mel_pred, dur_pred, stop_pred = model(...)
-            loss = criterion(mel_pred, mel_specs, ...)
+Default config: batch size 16, hidden dim 512, 6 encoder/decoder layers, 1e-4 learning rate, mixed precision enabled.
 
-        # 4. Backward pass
-        scaler.scale(loss).backward()
+Small config for testing: batch size 8, hidden dim 256, 4 encoder/decoder layers.
 
-        # 5. Optimizer step
-        scaler.unscale_(optimizer)
-        clip_grad_norm_(model.parameters(), max_norm=1.0)
-        scaler.step(optimizer)
-        scaler.update()
-
-        # 6. Log to W&B (every 10 batches)
-        if batch_idx % 10 == 0:
-            wandb.log({
-                'train/batch_total_loss': loss.item(),
-                ...
-            })
-
-    # 7. Epoch end
-    scheduler.step()
-    save_checkpoint(epoch, loss)
-    wandb.log({'train/epoch_total_loss': avg_loss})
-```
-
-## Configuration Examples
-
-### Standard Training:
-```python
-config = get_default_config()
-# - Batch size: 16
-# - Hidden dim: 512
-# - Encoder/Decoder: 6 layers each
-# - Learning rate: 1e-4
-# - Mixed precision: Enabled
-```
-
-### Small Model (Testing):
-```python
-config = get_small_config()
-# - Batch size: 8
-# - Hidden dim: 256
-# - Encoder/Decoder: 4 layers each
-# - Faster training for debugging
-```
-
-### Custom Configuration:
+Custom config example:
 ```python
 config = EnglishTrainingConfig(
     data_dir="LJSpeech-1.1",
@@ -200,91 +47,28 @@ config = EnglishTrainingConfig(
 
 ## Key Features
 
-### Mixed Precision Training:
-- **CUDA**: Native `torch.cuda.amp.GradScaler`
-- **MPS**: Custom `MPSGradScaler` (Apple Silicon)
-- **Benefits**: 30-50% faster, 40-60% less memory
-- **Fallback**: Disabled on CPU or if errors occur
+Mixed precision: CUDA uses native `torch.cuda.amp.GradScaler`, MPS uses custom `MPSGradScaler`. Provides 30-50% speed improvement and 40-60% memory reduction. Falls back to FP32 on CPU or if errors occur.
 
-### Adaptive Memory Management:
-- Monitors GPU/MPS memory every batch
-- Cleans up cache when pressure detected
-- Prevents OOM errors proactively
-- Tracks overhead (<1% typical)
+Adaptive memory management monitors GPU/MPS memory every batch, cleans cache when pressure detected, prevents OOM proactively. Overhead typically <1%.
 
-### Weights & Biases Integration:
-- Automatic experiment tracking
-- Real-time loss curves
-- System metrics (GPU, memory)
-- Hyperparameter logging
-- Model checkpointing to cloud
+W&B integration provides automatic experiment tracking, real-time loss curves, system metrics, hyperparameter logging, model checkpointing to cloud.
 
-### Checkpoint Management:
-- Auto-resume with `--resume auto`
-- Saves every N epochs (configurable)
-- Includes full training state
-- Model selection by lowest loss
+Checkpoint management with auto-resume using `--resume auto`. Saves every N epochs (configurable), includes full training state, enables model selection by lowest loss.
 
 ## Performance Tips
 
-### Memory Optimization:
-1. **Gradient Checkpointing**: Enabled by default (75% memory reduction)
-2. **Adaptive Cleanup**: Prevents OOM without sacrificing speed
-3. **Batch Size**: Start large, reduce if OOM
-4. **Mixed Precision**: Use `--no-mixed-precision` if unstable
+Memory optimization: gradient checkpointing enabled by default (75% reduction), adaptive cleanup prevents OOM, start with large batch size and reduce if needed, use `--no-mixed-precision` if unstable.
 
-### Speed Optimization:
-1. **Data Loading**: Use 2-4 workers (not more)
-2. **Pin Memory**: Enabled for CUDA automatically
-3. **Length-Based Batching**: Reduces padding waste
-4. **Profiling**: Disable after debugging (`enable_profiling=False`)
+Speed optimization: use 2-4 data workers (not more), pin memory enabled for CUDA automatically, length-based batching reduces padding waste, disable profiling after debugging.
 
-### Quality Optimization:
-1. **Learning Rate**: 1e-4 is good default
-2. **Scheduler**: Cosine annealing with warm restarts
-3. **Gradient Clipping**: Prevents exploding gradients
-4. **MFA Alignments**: Essential for duration accuracy
-
-## Dependencies
-
-- `torch` - PyTorch training
-- `wandb` - Experiment tracking (optional)
-- `tqdm` - Progress bars
-- `data.ljspeech_dataset` - Dataset
-- `kokoro.model` - Model architecture
-
-## Design Principles
-
-1. **Modularity**: Separate concerns (training, logging, memory)
-2. **Robustness**: Graceful degradation, error recovery
-3. **Observability**: Comprehensive logging and metrics
-4. **Efficiency**: Mixed precision, adaptive memory
-5. **Simplicity**: Clean APIs, minimal configuration
+Quality optimization: 1e-4 learning rate is good default, cosine annealing with warm restarts for scheduling, gradient clipping prevents exploding gradients, MFA alignments essential for duration accuracy.
 
 ## Common Issues
 
-### OOM Errors:
-- Reduce batch size
-- Enable gradient checkpointing
-- Disable mixed precision
-- Use adaptive memory management
+OOM errors: reduce batch size, enable gradient checkpointing, disable mixed precision, use adaptive memory management.
 
-### Slow Training:
-- Check data loading bottleneck (profiler)
-- Increase batch size if memory available
-- Use mixed precision
-- Reduce number of workers if CPU-bound
+Slow training: check data loading bottleneck with profiler, increase batch size if memory available, use mixed precision, reduce workers if CPU-bound.
 
-### NaN Losses:
-- Check learning rate (too high?)
-- Disable mixed precision temporarily
-- Check input data (NaN values?)
-- Review gradient clipping
+NaN losses: check learning rate (possibly too high), disable mixed precision temporarily, check input data for NaN values, review gradient clipping.
 
-## Notes
-
-- Checkpoints saved every 5 epochs by default
-- W&B logging optional but recommended
-- Mixed precision tested on CUDA and MPS
-- Adaptive memory manager works on all devices
-- Profiling adds ~5% overhead when enabled
+Checkpoints saved every 5 epochs by default. W&B logging optional but recommended. Mixed precision tested on CUDA and MPS. Adaptive memory manager works on all devices. Profiling adds ~5% overhead when enabled.
