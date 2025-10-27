@@ -4,7 +4,19 @@ Core Transformer-based TTS model architecture.
 
 ## Differences from Kokoro-82M
 
-This implementation differs from the official Kokoro-82M released model in key ways. The official model uses monotonic alignment search (similar to Tacotron 2) for learning alignments during training, while this uses explicit MFA-derived durations with a duration predictor. Kokoro-82M employs guided attention mechanisms and location-sensitive attention, whereas this uses standard multi-head attention with teacher forcing. The production model includes style tokens for prosody control and multi-speaker embeddings, which are absent here. Additionally, Kokoro-82M has various production optimizations (custom CUDA kernels, quantization support, streaming inference) not present in this educational implementation. This version is ~22M parameters vs the 82M in the official release, using a simpler architecture focused on training transparency.
+The official Kokoro-82M is a decoder-only architecture based on StyleTTS 2 and iSTFTNet, trained in two stages with adversarial training. Key components include:
+
+**Text Encoder**: Phoneme-level BERT transformer pre-trained on Wikipedia, encoding input phonemes into representations. StyleTTS 2 uses both acoustic and prosodic text encoders.
+
+**Style Encoder**: For multi-speaker synthesis, extracts style vectors from reference audio to control prosody and speaker characteristics. This enables zero-shot voice cloning and style transfer.
+
+**Discriminator**: 12-layer WavLM model pre-trained on 94k hours of speech data, frozen during training to prevent overpowering. Used in adversarial training to improve naturalness.
+
+**iSTFTNet Vocoder**: Instead of directly generating waveforms like HiFi-GAN, it predicts magnitude and phase spectrograms which are converted to audio via inverse STFT. This hybrid approach reduces computational cost and model size while maintaining quality.
+
+**Training**: Two-stage process. Stage 1 trains acoustic modules for mel-spectrogram reconstruction. Stage 2 trains TTS prediction modules (duration, prosody) using fixed acoustic modules from stage 1, with style diffusion and adversarial training.
+
+This implementation differs fundamentally: uses a simple encoder-decoder transformer (~22M vs 82M parameters), explicit MFA-derived durations instead of learned alignments through diffusion, teacher forcing with standard multi-head attention instead of WavLM adversarial training, no style encoder (no prosody control or multi-speaker support), single-stage training without adversarial loss, and external HiFi-GAN vocoder instead of integrated iSTFTNet. This version prioritizes educational clarity over production sophistication.
 
 ## Files
 

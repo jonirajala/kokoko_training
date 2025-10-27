@@ -4,7 +4,9 @@ Training implementation for English text-to-speech using the Kokoro Transformer 
 
 ## Current State
 
-This is a simplified training implementation based on the Kokoro architecture. It differs from the official Kokoro-82M model in several ways: uses explicit duration prediction instead of monotonic alignment search, employs teacher forcing during training rather than guided attention, has a simpler architecture (no style tokens or multi-speaker embedding), and uses standard transformer blocks without the production optimizations found in the released model. This implementation prioritizes training clarity and educational value over matching the exact production architecture.
+This is a simplified training implementation based on the Kokoro architecture. The official Kokoro-82M uses a decoder-only architecture based on StyleTTS 2 and iSTFTNet, with no diffusion or encoder. It employs a text encoder (phoneme-level BERT), style encoder for prosody control, WavLM-based discriminator (12 layers, pre-trained on 94k hours), and iSTFTNet vocoder which generates magnitude and phase for inverse STFT conversion rather than direct waveform generation. The training uses two stages: first training acoustic modules for mel-spectrogram reconstruction, then training TTS prediction modules with style diffusion and adversarial training.
+
+This implementation differs significantly: uses explicit MFA-derived durations with a duration predictor instead of StyleTTS 2's diffusion-based style modeling and alignment, employs teacher forcing with standard multi-head attention rather than WavLM discriminator and adversarial training, has no style encoder or multi-speaker embeddings, uses a simple encoder-decoder transformer (~22M parameters vs 82M), and relies on external HiFi-GAN vocoder instead of integrated iSTFTNet. This implementation prioritizes training clarity and educational value over matching the production architecture.
 
 ## Features
 
