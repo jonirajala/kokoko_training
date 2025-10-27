@@ -38,6 +38,8 @@ torchcodec
 
 misaki[en]
 
+typing-extensions
+
 # Standard library dependencies (usually included with Python)
 # os
 # json
