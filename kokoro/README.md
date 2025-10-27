@@ -18,6 +18,24 @@ The official Kokoro-82M is a decoder-only architecture based on StyleTTS 2 and i
 
 This implementation differs fundamentally: uses a simple encoder-decoder transformer (~22M vs 82M parameters), explicit MFA-derived durations instead of learned alignments through diffusion, teacher forcing with standard multi-head attention instead of WavLM adversarial training, no style encoder (no prosody control or multi-speaker support), single-stage training without adversarial loss, and external HiFi-GAN vocoder instead of integrated iSTFTNet. This version prioritizes educational clarity over production sophistication.
 
+| Component | Kokoro-82M (Official) | This Implementation |
+|-----------|----------------------|---------------------|
+| **Architecture Type** | Decoder-only | Encoder-decoder |
+| **Base Model** | StyleTTS 2 + iSTFTNet | Custom transformer |
+| **Parameters** | 82M | ~22M |
+| **Text Encoding** | BERT (phoneme-level, pre-trained) | Transformer encoder (6 layers) |
+| **Style Modeling** | Style encoder + diffusion | None |
+| **Duration Modeling** | Learned via alignment + diffusion | Explicit MLP predictor (MFA) |
+| **Prosody Control** | Style vectors from reference audio | None |
+| **Speaker Control** | Multi-speaker (zero-shot cloning) | Single speaker only |
+| **Discriminator** | WavLM (12 layers, frozen, 94k hours) | None |
+| **Training Stages** | Two-stage (acoustic → TTS) | Single-stage |
+| **Training Method** | Adversarial + diffusion | Supervised (MSE + BCE) |
+| **Vocoder** | Integrated iSTFTNet (mag + phase) | External HiFi-GAN |
+| **Attention Type** | StyleTTS 2 attention mechanisms | Standard multi-head |
+| **Training Data** | Few hundred hours (permissive) | LJSpeech (24 hours) |
+| **Output** | 24kHz audio | 22.05kHz audio |
+
 ## Files
 
 `model.py` contains the complete Kokoro TTS model with text encoder (Transformer), duration predictor (MLP), length regulator (duration expansion), mel decoder (Transformer), and stop token predictor. Main methods are `forward()` for training with teacher forcing, `inference()` for autoregressive generation, and `get_model_info()` for parameter stats.
