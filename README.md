@@ -123,10 +123,6 @@ python training_english.py \
 
 P4000 GPU (8GB) takes about 38 minutes per epoch with batch size 16. Full training (100 epochs) takes around 63 hours. Checkpoints are saved every 5 epochs at ~200MB each.
 
-## Monitoring with Weights & Biases
-
-Training with `--wandb` logs loss curves (total, mel, duration, stop token), learning rate schedule, system metrics (GPU utilization, memory, temperature), and memory management stats (cleanup frequency, pressure levels). Charts update every 10 batches.
-
 ## Inference
 
 Basic usage:
