@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 # Dataset URLs
 LJSPEECH_URL = "https://data.keithito.com/data/speech/LJSpeech-1.1.tar.bz2"
-LJSPEECH_ZENODO_ALIGNMENTS_URL = "https://zenodo.org/records/7499098/files/grids.zip"
+LJSPEECH_ZENODO_ALIGNMENTS_URL = "https://zenodo.org/api/records/7499098/files/grids.zip/content"
 
 LJSPEECH_DIR = "LJSpeech-1.1"
 LJSPEECH_ARCHIVE = "LJSpeech-1.1.tar.bz2"
@@ -154,19 +154,26 @@ def download_zenodo_alignments(dataset_path: str):
         logger.error(f"Alignment download failed: {e}")
         sys.exit(1)
 
-    # Extract to dataset directory
+    # Extract to TextGrid directory
     logger.info("Extracting alignments...")
     try:
+        # Create TextGrid directory if it doesn't exist
+        textgrid_path.mkdir(parents=True, exist_ok=True)
+
+        # Extract directly into TextGrid directory
         subprocess.run(
-            ["unzip", "-q", str(archive_path), "-d", str(dataset_path)],
+            ["unzip", "-q", str(archive_path), "-d", str(textgrid_path)],
             check=True
         )
 
-        # Rename grids to TextGrid if needed
-        grids_path = dataset_path / "grids"
-        if grids_path.exists() and not textgrid_path.exists():
-            grids_path.rename(textgrid_path)
-            logger.info(f"Renamed 'grids' to 'TextGrid'")
+        # Check if files were extracted to a grids subdirectory
+        grids_path = textgrid_path / "grids"
+        if grids_path.exists():
+            # Move files from grids/ to TextGrid/ and remove grids/
+            logger.info("Reorganizing extracted files...")
+            for textgrid_file in grids_path.glob("*.TextGrid"):
+                textgrid_file.rename(textgrid_path / textgrid_file.name)
+            grids_path.rmdir()
 
         logger.info("Extraction complete")
 

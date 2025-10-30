@@ -208,7 +208,7 @@ kokoro-english-tts/
 
 ## Requirements
 
-- Python 3.9+
+- Python 3.11 (atleast tested with this)
 - PyTorch 2.0+ (CUDA 11.8+ for GPU)
 - misaki[en] - English G2P
 - librosa, soundfile - Audio processing
