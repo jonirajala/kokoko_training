@@ -20,10 +20,11 @@ logger = logging.getLogger(__name__)
 
 # Dataset URLs
 LJSPEECH_URL = "https://data.keithito.com/data/speech/LJSpeech-1.1.tar.bz2"
-LJSPEECH_ZENODO_URL = "https://zenodo.org/records/7499098/files/LJSpeech-1.1.tar.bz2"
+LJSPEECH_ZENODO_ALIGNMENTS_URL = "https://zenodo.org/records/7499098/files/grids.zip"
 
 LJSPEECH_DIR = "LJSpeech-1.1"
 LJSPEECH_ARCHIVE = "LJSpeech-1.1.tar.bz2"
+ALIGNMENTS_ARCHIVE = "grids.zip"
 
 
 def check_command_exists(command: str) -> bool:
@@ -40,13 +41,11 @@ def check_command_exists(command: str) -> bool:
         return False
 
 
-def download_ljspeech(output_dir: str = ".", use_zenodo: bool = False):
+def download_ljspeech(output_dir: str = "."):
     """Download LJSpeech dataset
 
     Args:
         output_dir: Directory to download to
-        use_zenodo: If True, download pre-aligned version from Zenodo (3.8GB with MFA alignments)
-                   If False, download original version (2.6GB, no alignments)
     """
     output_path = Path(output_dir)
     archive_path = output_path / LJSPEECH_ARCHIVE
@@ -60,19 +59,10 @@ def download_ljspeech(output_dir: str = ".", use_zenodo: bool = False):
             logger.info("Skipping download")
             return str(dataset_path)
 
-    # Choose URL
-    if use_zenodo:
-        url = LJSPEECH_ZENODO_URL
-        size = "3.8 GB"
-        logger.info("Downloading PRE-ALIGNED version from Zenodo")
-        logger.info("This includes MFA alignments - no need to run alignment step!")
-    else:
-        url = LJSPEECH_URL
-        size = "2.6 GB"
-        logger.info("Downloading original version")
-        logger.info("You will need to run MFA alignment afterward for best quality")
-
     # Download
+    url = LJSPEECH_URL
+    size = "2.6 GB"
+    logger.info("Downloading LJSpeech dataset")
     logger.info(f"Downloading from: {url}")
     logger.info(f"This is a {size} download - it may take a while...")
 
@@ -117,6 +107,80 @@ def download_ljspeech(output_dir: str = ".", use_zenodo: bool = False):
 
     logger.info(f"LJSpeech dataset ready at: {dataset_path}")
     return str(dataset_path)
+
+
+def download_zenodo_alignments(dataset_path: str):
+    """Download pre-computed MFA alignments from Zenodo
+
+    Args:
+        dataset_path: Path to LJSpeech dataset directory
+    """
+    dataset_path = Path(dataset_path)
+    output_path = dataset_path.parent
+    archive_path = output_path / ALIGNMENTS_ARCHIVE
+    textgrid_path = dataset_path / "TextGrid"
+
+    # Check if alignments already exist
+    if textgrid_path.exists():
+        logger.info(f"TextGrid alignments already exist at: {textgrid_path}")
+        response = input("Re-download? (y/N): ").strip().lower()
+        if response != 'y':
+            logger.info("Skipping alignment download")
+            return str(textgrid_path)
+
+    # Download alignments
+    url = LJSPEECH_ZENODO_ALIGNMENTS_URL
+    logger.info("Downloading pre-computed MFA alignments from Zenodo")
+    logger.info(f"Downloading from: {url}")
+
+    try:
+        if check_command_exists("wget"):
+            subprocess.run(
+                ["wget", "-O", str(archive_path), url],
+                check=True
+            )
+        elif check_command_exists("curl"):
+            subprocess.run(
+                ["curl", "-L", "-o", str(archive_path), url],
+                check=True
+            )
+        else:
+            logger.error("Neither wget nor curl found. Please install one of them.")
+            sys.exit(1)
+
+        logger.info("Download complete")
+
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Alignment download failed: {e}")
+        sys.exit(1)
+
+    # Extract to dataset directory
+    logger.info("Extracting alignments...")
+    try:
+        subprocess.run(
+            ["unzip", "-q", str(archive_path), "-d", str(dataset_path)],
+            check=True
+        )
+
+        # Rename grids to TextGrid if needed
+        grids_path = dataset_path / "grids"
+        if grids_path.exists() and not textgrid_path.exists():
+            grids_path.rename(textgrid_path)
+            logger.info(f"Renamed 'grids' to 'TextGrid'")
+
+        logger.info("Extraction complete")
+
+        # Remove archive to save space
+        logger.info("Removing archive to save space...")
+        archive_path.unlink()
+
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Extraction failed: {e}")
+        logger.info("Make sure 'unzip' is installed")
+        sys.exit(1)
+
+    logger.info(f"Pre-computed alignments ready at: {textgrid_path}")
+    return str(textgrid_path)
 
 
 def setup_mfa():
@@ -274,7 +338,7 @@ def main():
     parser.add_argument(
         '--zenodo',
         action='store_true',
-        help='Download pre-aligned version from Zenodo (3.8GB with MFA alignments)'
+        help='Download pre-computed MFA alignments from Zenodo (faster than running MFA locally)'
     )
 
     parser.add_argument(
@@ -306,14 +370,15 @@ def main():
 
     # Check for conflicting flags
     if args.zenodo and args.align:
-        logger.warning("--zenodo includes pre-aligned data, --align is not needed")
-        logger.info("Proceeding with Zenodo download (alignments already included)")
+        logger.warning("Using both --zenodo and --align is redundant")
+        logger.info("--zenodo will download pre-computed alignments, --align will run MFA locally")
+        logger.info("You typically only need one of these options")
 
     dataset_path = None
 
     # Download dataset
     if not args.skip_download and not args.align_only:
-        dataset_path = download_ljspeech(str(output_dir), use_zenodo=args.zenodo)
+        dataset_path = download_ljspeech(str(output_dir))
     else:
         dataset_path = str(output_dir / LJSPEECH_DIR)
         if not Path(dataset_path).exists():
@@ -321,17 +386,29 @@ def main():
             logger.info("Run without --skip-download to download it")
             sys.exit(1)
 
-    # Setup/check MFA (skip if using Zenodo with pre-aligned data)
+    # Download pre-computed alignments from Zenodo if requested
     if args.zenodo and not args.align_only:
-        logger.info("\nSkipping MFA setup (using pre-aligned Zenodo data)")
-        mfa_installed = False
+        logger.info("\n" + "="*70)
+        logger.info("Downloading pre-computed alignments from Zenodo")
+        logger.info("="*70 + "\n")
+        download_zenodo_alignments(dataset_path)
+        mfa_installed = False  # Skip MFA setup since we have alignments
     else:
+        # Setup/check MFA for local alignment
         mfa_installed = setup_mfa()
 
-    # Run alignment if requested (but warn if using Zenodo)
+    # Run alignment locally if requested
     if args.align or args.align_only:
         if args.zenodo and not args.align_only:
-            logger.warning("Zenodo dataset already includes alignments - skipping MFA")
+            logger.warning("Zenodo alignments already downloaded - local MFA not needed")
+            response = input("Run MFA alignment anyway? (y/N): ").strip().lower()
+            if response != 'y':
+                logger.info("Skipping local MFA alignment")
+            elif not mfa_installed:
+                logger.error("Cannot run alignment - MFA is not installed")
+                sys.exit(1)
+            else:
+                run_mfa_alignment(dataset_path)
         elif not mfa_installed:
             logger.error("Cannot run alignment - MFA is not installed")
             sys.exit(1)
@@ -348,7 +425,9 @@ def main():
 
     if not Path(dataset_path).joinpath("TextGrid").exists():
         print("\n⚠️  No MFA alignments found!")
-        print("\nFor better quality, run alignment:")
+        print("\nFor better quality, get pre-computed alignments:")
+        print(f"  python setup_ljspeech.py --zenodo --skip-download")
+        print("\nOr run MFA alignment locally (takes 1-3 hours):")
         print(f"  python setup_ljspeech.py --align-only")
         print("\nOr train without alignments (lower quality):")
         print(f"  python training_english.py --corpus {dataset_path}")
