@@ -26,7 +26,7 @@ from data.ljspeech_dataset import LJSpeechDataset, collate_fn, LengthBasedBatchS
 from kokoro.model import KokoroModel
 from .checkpoint_manager import (
     save_phoneme_processor, save_model_config, load_checkpoint, find_latest_checkpoint,
-    save_checkpoint, save_final_model
+    save_checkpoint, save_final_model, cleanup_old_checkpoints, check_disk_space
 )
 from .interbatch_profiler import InterbatchProfiler
 from .mps_grad_scaler import MPSGradScaler
@@ -630,7 +630,12 @@ class KokoroTrainer:
         logger.info(f"Resumed from epoch {self.start_epoch}, best loss {self.best_loss:.4f}")
 
     def save_checkpoint_with_scaler(self, epoch: int, loss: float):
-        """Save checkpoint including scaler state"""
+        """Save checkpoint including scaler state with disk space check and cleanup"""
+        # Check disk space before saving
+        if not check_disk_space(self.config.output_dir, min_free_gb=5.0):
+            logger.warning(f"Skipping checkpoint save for epoch {epoch+1} due to insufficient disk space")
+            return
+
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
@@ -645,8 +650,18 @@ class KokoroTrainer:
             checkpoint['device_type'] = self.device_type  # Store device type for proper restoration
 
         checkpoint_path = os.path.join(self.config.output_dir, f'checkpoint_epoch_{epoch+1}.pth')
-        torch.save(checkpoint, checkpoint_path)
-        logger.info(f"Checkpoint saved to {checkpoint_path}")
+
+        try:
+            torch.save(checkpoint, checkpoint_path)
+            logger.info(f"Checkpoint saved to {checkpoint_path}")
+
+            # Cleanup old checkpoints if configured
+            keep_last_n = getattr(self.config, 'keep_last_n_checkpoints', 3)
+            if keep_last_n > 0:
+                cleanup_old_checkpoints(self.config.output_dir, keep_last_n)
+        except Exception as e:
+            logger.error(f"Failed to save checkpoint: {e}")
+            logger.error("Training will continue without this checkpoint")
 
     def train_epoch(self, epoch: int) -> Tuple[float, float, float, float]:
         """Train for one epoch with enhanced profiling, mixed precision, and adaptive memory management"""

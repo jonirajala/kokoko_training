@@ -73,7 +73,12 @@ def save_checkpoint(
     config: TrainingConfig,
     output_dir: str
 ):
-    """Save training checkpoint"""
+    """Save training checkpoint with disk space check and cleanup"""
+    # Check disk space before saving
+    if not check_disk_space(output_dir, min_free_gb=5.0):
+        logger.warning(f"Skipping checkpoint save for epoch {epoch+1} due to insufficient disk space")
+        return
+
     checkpoint = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -83,8 +88,18 @@ def save_checkpoint(
         'config': config
     }
     checkpoint_path = os.path.join(output_dir, f"checkpoint_epoch_{epoch+1}.pth")
-    torch.save(checkpoint, checkpoint_path)
-    logger.info(f"Checkpoint saved: {checkpoint_path}")
+
+    try:
+        torch.save(checkpoint, checkpoint_path)
+        logger.info(f"Checkpoint saved: {checkpoint_path}")
+
+        # Cleanup old checkpoints if configured
+        keep_last_n = getattr(config, 'keep_last_n_checkpoints', 3)
+        if keep_last_n > 0:
+            cleanup_old_checkpoints(output_dir, keep_last_n)
+    except Exception as e:
+        logger.error(f"Failed to save checkpoint: {e}")
+        logger.error("Training will continue without this checkpoint")
 
 
 def load_checkpoint(
@@ -192,6 +207,88 @@ def find_latest_checkpoint(output_dir: str) -> Optional[str]:
 
     logger.info(f"Found latest checkpoint: {latest_checkpoint}")
     return str(latest_checkpoint)
+
+
+def cleanup_old_checkpoints(output_dir: str, keep_last_n: int = 3):
+    """
+    Delete old checkpoints, keeping only the last N checkpoints.
+
+    Args:
+        output_dir: Directory containing checkpoints
+        keep_last_n: Number of most recent checkpoints to keep (default: 3)
+    """
+    if keep_last_n <= 0:
+        logger.warning("keep_last_n must be positive, skipping cleanup")
+        return
+
+    checkpoint_dir = Path(output_dir)
+    if not checkpoint_dir.exists():
+        return
+
+    # Find all checkpoint files
+    checkpoint_files = list(checkpoint_dir.glob("checkpoint_epoch_*.pth"))
+    if not checkpoint_files:
+        return
+
+    # Sort by epoch number (oldest first)
+    checkpoint_files.sort(key=lambda x: int(x.stem.split('_')[-1]))
+
+    # Calculate how many to delete
+    num_checkpoints = len(checkpoint_files)
+    num_to_delete = num_checkpoints - keep_last_n
+
+    if num_to_delete <= 0:
+        logger.debug(f"Only {num_checkpoints} checkpoints exist, no cleanup needed (keeping last {keep_last_n})")
+        return
+
+    # Delete old checkpoints
+    deleted_count = 0
+    total_size_freed = 0
+
+    for checkpoint_file in checkpoint_files[:num_to_delete]:
+        try:
+            file_size = checkpoint_file.stat().st_size
+            checkpoint_file.unlink()
+            total_size_freed += file_size
+            deleted_count += 1
+            logger.info(f"Deleted old checkpoint: {checkpoint_file.name} ({file_size / 1024**2:.1f} MB)")
+        except Exception as e:
+            logger.warning(f"Failed to delete checkpoint {checkpoint_file}: {e}")
+
+    if deleted_count > 0:
+        logger.info(f"Cleanup complete: Deleted {deleted_count} old checkpoint(s), "
+                   f"freed {total_size_freed / 1024**2:.1f} MB, "
+                   f"keeping last {keep_last_n} checkpoint(s)")
+
+
+def check_disk_space(output_dir: str, min_free_gb: float = 5.0) -> bool:
+    """
+    Check if there's enough disk space before saving checkpoint.
+
+    Args:
+        output_dir: Directory where checkpoint will be saved
+        min_free_gb: Minimum free space required in GB (default: 5.0)
+
+    Returns:
+        True if enough space available, False otherwise
+    """
+    import shutil
+
+    try:
+        stats = shutil.disk_usage(output_dir)
+        free_gb = stats.free / (1024**3)
+
+        if free_gb < min_free_gb:
+            logger.error(f"Insufficient disk space: {free_gb:.2f} GB free, need at least {min_free_gb} GB")
+            logger.error("Please free up disk space or reduce checkpoint frequency")
+            return False
+
+        logger.debug(f"Disk space check passed: {free_gb:.2f} GB free")
+        return True
+
+    except Exception as e:
+        logger.warning(f"Could not check disk space: {e}")
+        return True  # Proceed anyway if check fails
 
 
 def save_final_model(model: torch.nn.Module, config: TrainingConfig, output_dir: str):

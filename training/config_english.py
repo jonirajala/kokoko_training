@@ -68,8 +68,9 @@ class EnglishTrainingConfig:
     persistent_workers: bool = True     # Keep workers alive between epochs (only used if num_workers > 0)
 
     # Checkpointing
-    save_every: int = 1                 # Save checkpoint every N epochs
+    save_every: int = 5                 # Save checkpoint every N epochs (increased to save disk space)
     resume_checkpoint: str = 'auto'     # Resume from checkpoint ('auto' for latest, or path to .pth)
+    keep_last_n_checkpoints: int = 3    # Only keep the last N checkpoints (auto-delete old ones)
 
     # Gradient checkpointing (memory optimization)
     gradient_checkpointing: bool = True # Enable gradient checkpointing
