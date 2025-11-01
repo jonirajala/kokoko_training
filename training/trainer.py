@@ -25,7 +25,7 @@ from .device_type import DeviceType
 from data.ljspeech_dataset import LJSpeechDataset, collate_fn, LengthBasedBatchSampler
 from kokoro.model import KokoroModel
 from .checkpoint_manager import (
-    save_phoneme_processor, load_checkpoint, find_latest_checkpoint,
+    save_phoneme_processor, save_model_config, load_checkpoint, find_latest_checkpoint,
     save_checkpoint, save_final_model
 )
 from .interbatch_profiler import InterbatchProfiler
@@ -123,14 +123,19 @@ class KokoroTrainer:
             shuffle=True
         )
 
+        # Configure DataLoader parameters
+        num_workers = getattr(config, 'num_workers', 2)
+        prefetch_factor = getattr(config, 'prefetch_factor', 3) if num_workers > 0 else None
+        persistent_workers = getattr(config, 'persistent_workers', True) and num_workers > 0
+
         self.dataloader = DataLoader(
             self.dataset,
             batch_sampler=self.batch_sampler,
             collate_fn=collate_fn,
-            num_workers=2,
+            num_workers=num_workers,
             pin_memory=config.pin_memory and self.device.type == DeviceType.CUDA.value,
-            prefetch_factor=3,
-            persistent_workers=True
+            prefetch_factor=prefetch_factor,
+            persistent_workers=persistent_workers
         )
 
         # Initialize model
@@ -196,9 +201,10 @@ class KokoroTrainer:
             return torch.no_grad().__enter__()  # No-op context
 
         if self.device_type == DeviceType.CUDA.value:
-            return torch.cuda.amp.autocast('cuda')
+            # Use new API: torch.amp.autocast instead of torch.cuda.amp.autocast
+            return torch.amp.autocast('cuda', dtype=self.mixed_precision_dtype)
         elif self.device_type == DeviceType.MPS.value:
-            return torch.autocast(device_type='mps', dtype=self.mixed_precision_dtype)
+            return torch.amp.autocast('mps', dtype=self.mixed_precision_dtype)
         else:
             return torch.no_grad().__enter__()  # No-op context
 
@@ -937,6 +943,7 @@ class KokoroTrainer:
 
         self.setup_checkpoint_resumption()
         save_phoneme_processor(self.dataset.phoneme_processor, self.config.output_dir)
+        save_model_config(self.config, self.config.output_dir)
 
         logger.info(f"Starting training on device: {self.device} ({self.device_type})")
         logger.info(f"Mixed precision training: {'Enabled' if self.use_mixed_precision else 'Disabled'}")
@@ -1222,63 +1229,19 @@ def train_model(config: TrainingConfig):
 
 # Example usage (if running train.py directly)
 if __name__ == "__main__":
-    class TrainingConfig:
-        def __init__(self):
-            self.data_dir = "data/processed_data"
-            self.output_dir = "output_models"
-            self.num_epochs = 100
-            self.batch_size = 16
-            self.learning_rate = 1e-4
-            self.device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-            self.lr_T_0 = 20
-            self.lr_T_mult = 2
-            self.lr_eta_min = 1e-6
-            self.save_every = 5
-            self.resume_checkpoint = 'auto'
-            self.n_mels = 80
-            self.hidden_dim = 512
-            self.duration_loss_weight = 0.1
-            self.stop_token_loss_weight = 1.0
-            self.max_seq_length = 2500
-            self.sample_rate = 22050
-            self.hop_length = 256
-            self.win_length = 1024
-            self.n_fft = 1024
-            self.f_min = 0.0
-            self.f_max = 8000.0
-            self.num_workers = 1
-            self.pin_memory = False # Pin memory only for CUDA, automatically disabled for MPS
+    # Use the proper config from config_english.py instead of duplicating
+    from .config_english import EnglishTrainingConfig
 
-            # Enhanced profiler configurations
-            self.enable_profiling = False
-            self.profile_epoch_start = 1  # Start profiling from this epoch (0-indexed)
-            self.profile_wait_steps = 1  # Number of steps to wait before starting warmup
-            self.profile_warmup_steps = 1 # Number of steps to warm up the profiler
-            self.profile_steps = 5       # Number of active steps to profile
-            self.run_standalone_profiling = False  # Run standalone profiling before training
-
-            # Interbatch profiling configurations
-            self.enable_interbatch_profiling = False  # Enable interbatch profiling
-            self.interbatch_report_interval = 100    # Report interbatch stats every N batches
-
-            # Mixed precision training configurations
-            self.use_mixed_precision = True  # Enable mixed precision training (CUDA and MPS)
-            self.mixed_precision_dtype = torch.float16  # Mixed precision dtype (float16 or bfloat16)
-            self.amp_init_scale = 65536.0    # Initial scale for GradScaler
-            self.amp_growth_factor = 2.0     # Scale growth factor
-            self.amp_backoff_factor = 0.5    # Scale backoff factor when overflow detected
-            self.amp_growth_interval = 2000  # Steps between scale growth attempts
-
-            # Optimizer configurations
-            self.weight_decay = 0.01
-            self.adam_eps = 1e-8
-            self.adam_betas = (0.9, 0.999)
-
-            # Adaptive memory management configurations
-            self.enable_adaptive_memory = True   # Enable adaptive memory management
-            self.memory_report_interval = 500    # Report memory stats every N batches
-
-    temp_config = TrainingConfig()
+    temp_config = EnglishTrainingConfig(
+        data_dir="data/processed_data",
+        output_dir="output_models",
+        num_epochs=100,
+        batch_size=16,
+        save_every=5,
+        num_workers=1,
+        enable_profiling=False,
+        run_standalone_profiling=False,
+    )
 
     # Device-specific adjustments
     if temp_config.device == DeviceType.MPS.value:

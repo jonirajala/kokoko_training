@@ -5,14 +5,23 @@ Validates that all components work before training
 """
 
 import sys
+import os
 import logging
 from pathlib import Path
+
+# Set environment variable to suppress config printing during tests
+os.environ['TESTING'] = '1'
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Suppress verbose logging from other modules during testing
+logging.getLogger('training.config_english').setLevel(logging.WARNING)
+logging.getLogger('training.checkpoint_manager').setLevel(logging.WARNING)
+logging.getLogger('data.english_phoneme_processor').setLevel(logging.WARNING)
 
 
 def test_imports():
@@ -100,9 +109,9 @@ def test_phoneme_processor():
         from data.english_phoneme_processor import EnglishPhonemeProcessor
 
         processor = EnglishPhonemeProcessor('en-us')
-        logger.info(f"✓ Processor initialized: {processor}")
+        logger.info(f"✓ Processor initialized (vocab size: {processor.get_vocab_size()})")
 
-        # Test texts
+        # Test texts - just verify they work, don't print details
         test_cases = [
             "Hello, world!",
             "The quick brown fox jumps over the lazy dog.",
@@ -121,9 +130,7 @@ def test_phoneme_processor():
                 logger.error(f"✗ Length mismatch: {len(indices)} indices vs {len(phonemes)} phonemes")
                 return False
 
-            logger.info(f"✓ Text: '{text[:50]}...'")
-            logger.info(f"  Phonemes: {len(phonemes)} tokens")
-            logger.info(f"  Sample: {phonemes[:10]}...")
+        logger.info(f"✓ Text-to-phoneme conversion works ({len(test_cases)} test cases)")
 
         # Test serialization
         data = processor.to_dict()
@@ -136,7 +143,7 @@ def test_phoneme_processor():
             logger.error("✗ Serialization failed")
             return False
 
-        logger.info("\n✓ Phoneme processor tests passed!")
+        logger.info("✓ Phoneme processor tests passed!")
         return True
 
     except Exception as e:
@@ -154,22 +161,17 @@ def test_config():
         from training.config_english import EnglishTrainingConfig, get_small_config
 
         config = EnglishTrainingConfig()
-        logger.info(f"✓ Default config created")
-        logger.info(f"  Device: {config.device}")
-        logger.info(f"  Batch size: {config.batch_size}")
-        logger.info(f"  Sample rate: {config.sample_rate}")
+        logger.info(f"✓ Default config created (device: {config.device})")
 
         small_config = get_small_config()
         logger.info(f"✓ Small config created")
-        logger.info(f"  Hidden dim: {small_config.hidden_dim}")
-        logger.info(f"  Encoder layers: {small_config.n_encoder_layers}")
 
         # Test serialization
         config_dict = config.to_dict()
         config2 = EnglishTrainingConfig.from_dict(config_dict)
         logger.info("✓ Config serialization works")
 
-        logger.info("\n✓ Configuration tests passed!")
+        logger.info("✓ Configuration tests passed!")
         return True
 
     except Exception as e:
@@ -247,8 +249,6 @@ def test_model_compatibility():
         processor = EnglishPhonemeProcessor('en-us')
         vocab_size = processor.get_vocab_size()
 
-        logger.info(f"  Vocabulary size: {vocab_size}")
-
         # Create small model for testing
         model = KokoroModel(
             vocab_size=vocab_size,
@@ -262,11 +262,8 @@ def test_model_compatibility():
             gradient_checkpointing=False
         )
 
-        logger.info(f"✓ Model created with vocab size {vocab_size}")
-
         model_info = model.get_model_info()
-        logger.info(f"  Total parameters: {model_info['total_parameters']:,}")
-        logger.info(f"  Model size: {model_info['model_size_mb']:.1f} MB")
+        logger.info(f"✓ Model created ({model_info['total_parameters']:,} params, {model_info['model_size_mb']:.1f} MB)")
 
         # Test forward pass with dummy data
         batch_size = 2
@@ -278,8 +275,6 @@ def test_model_compatibility():
         phoneme_durations = torch.randint(1, 5, (batch_size, text_len)).float()
         stop_token_targets = torch.zeros(batch_size, mel_len)
 
-        logger.info("  Testing forward pass...")
-
         model.eval()
         with torch.no_grad():
             predicted_mel, predicted_durations, predicted_stop = model(
@@ -290,15 +285,169 @@ def test_model_compatibility():
             )
 
         logger.info(f"✓ Forward pass successful")
-        logger.info(f"  Predicted mel shape: {predicted_mel.shape}")
-        logger.info(f"  Predicted durations shape: {predicted_durations.shape}")
-        logger.info(f"  Predicted stop shape: {predicted_stop.shape}")
-
-        logger.info("\n✓ Model compatibility tests passed!")
+        logger.info("✓ Model compatibility tests passed!")
         return True
 
     except Exception as e:
         logger.error(f"✗ Model compatibility test failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def test_training_loop():
+    """Test training loop with single forward and backward pass using actual trainer"""
+    logger.info("\nTesting Training Loop (single iteration)...")
+
+    try:
+        import torch
+        from training.config_english import EnglishTrainingConfig
+        from data.english_phoneme_processor import EnglishPhonemeProcessor
+        from data.ljspeech_dataset import collate_fn
+        from kokoro.model import KokoroModel
+
+        # Create minimal config for testing
+        config = EnglishTrainingConfig()
+        config.batch_size = 2
+        config.hidden_dim = 128
+        config.n_encoder_layers = 2
+        config.n_decoder_layers = 2
+        config.encoder_ff_dim = 256
+        config.decoder_ff_dim = 256
+        config.gradient_checkpointing = False
+
+        # Create processor and model
+        processor = EnglishPhonemeProcessor('en-us')
+        vocab_size = processor.get_vocab_size()
+
+        model = KokoroModel(
+            vocab_size=vocab_size,
+            mel_dim=config.n_mels,
+            hidden_dim=config.hidden_dim,
+            n_encoder_layers=config.n_encoder_layers,
+            n_decoder_layers=config.n_decoder_layers,
+            n_heads=config.n_heads,
+            encoder_ff_dim=config.encoder_ff_dim,
+            decoder_ff_dim=config.decoder_ff_dim,
+            enable_profiling=False,
+            gradient_checkpointing=config.gradient_checkpointing
+        )
+        model.to(config.device)
+        model.train()
+
+        logger.info(f"✓ Created test model (vocab size: {vocab_size})")
+
+        # Create optimizer
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+
+        # Create loss criterions (same as trainer)
+        criterion_mel = torch.nn.MSELoss(reduction='none')
+        criterion_duration = torch.nn.MSELoss(reduction='none')
+        criterion_stop_token = torch.nn.BCEWithLogitsLoss(reduction='none')
+
+        # Create dummy batch
+        dummy_batch = [
+            {
+                'phoneme_indices': torch.randint(0, vocab_size, (10,), dtype=torch.long),
+                'mel_spec': torch.randn(20, config.n_mels),
+                'phoneme_durations': torch.randint(1, 5, (10,), dtype=torch.long),
+                'stop_token_targets': torch.zeros(20),
+                'audio_file': 'test1',
+                'text': 'Test one'
+            },
+            {
+                'phoneme_indices': torch.randint(0, vocab_size, (8,), dtype=torch.long),
+                'mel_spec': torch.randn(15, config.n_mels),
+                'phoneme_durations': torch.randint(1, 5, (8,), dtype=torch.long),
+                'stop_token_targets': torch.zeros(15),
+                'audio_file': 'test2',
+                'text': 'Test two'
+            }
+        ]
+
+        batch = collate_fn(dummy_batch)
+
+        # Move batch to device
+        phoneme_indices = batch['phoneme_indices'].to(config.device)
+        mel_specs = batch['mel_specs'].to(config.device)
+        phoneme_durations = batch['phoneme_durations'].to(config.device)
+        stop_token_targets = batch['stop_token_targets'].to(config.device)
+        phoneme_lengths = batch['phoneme_lengths'].to(config.device)
+        mel_lengths = batch['mel_lengths'].to(config.device)
+
+        # Forward pass
+        optimizer.zero_grad()
+
+        predicted_mel, predicted_log_durations, predicted_stop_logits = model(
+            phoneme_indices,
+            mel_specs,
+            phoneme_durations.float(),
+            stop_token_targets
+        )
+
+        logger.info(f"✓ Forward pass successful")
+
+        # Calculate losses using the same logic as trainer._calculate_losses()
+        # Mel Spectrogram Loss with masking
+        max_mel_len_batch = mel_specs.size(1)
+        mel_mask = torch.arange(max_mel_len_batch, device=config.device).expand(
+            len(mel_lengths), max_mel_len_batch) < mel_lengths.unsqueeze(1)
+        mel_mask = mel_mask.unsqueeze(-1).expand_as(predicted_mel).float()
+
+        loss_mel_unreduced = criterion_mel(predicted_mel, mel_specs)
+        loss_mel = (loss_mel_unreduced * mel_mask).sum() / mel_mask.sum()
+
+        # Duration Loss with masking
+        max_phoneme_len_batch = phoneme_durations.size(1)
+        phoneme_mask = torch.arange(max_phoneme_len_batch, device=config.device).expand(
+            len(phoneme_lengths), max_phoneme_len_batch) < phoneme_lengths.unsqueeze(1)
+        phoneme_mask = phoneme_mask.float()
+
+        target_log_durations = torch.log(phoneme_durations.float() + 1e-5)
+        loss_duration_unreduced = criterion_duration(predicted_log_durations, target_log_durations)
+        loss_duration = (loss_duration_unreduced * phoneme_mask).sum() / phoneme_mask.sum()
+
+        # Stop Token Loss with masking
+        stop_token_mask = mel_mask[:, :, 0]
+        loss_stop_token_unreduced = criterion_stop_token(predicted_stop_logits, stop_token_targets)
+        loss_stop_token = (loss_stop_token_unreduced * stop_token_mask).sum() / stop_token_mask.sum()
+
+        # Total loss (same as trainer)
+        total_loss = (loss_mel +
+                     loss_duration * config.duration_loss_weight +
+                     loss_stop_token * config.stop_token_loss_weight)
+
+        logger.info(f"✓ Loss calculation (total: {total_loss.item():.4f})")
+
+        # Backward pass
+        total_loss.backward()
+        logger.info(f"✓ Backward pass successful")
+
+        # Check gradients
+        has_gradients = False
+        gradient_norms = []
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                has_gradients = True
+                grad_norm = param.grad.norm().item()
+                gradient_norms.append(grad_norm)
+
+        if not has_gradients:
+            logger.error("✗ No gradients computed!")
+            return False
+
+        avg_grad_norm = sum(gradient_norms) / len(gradient_norms)
+        logger.info(f"✓ Gradients computed ({len(gradient_norms)} params, avg norm: {avg_grad_norm:.4f})")
+
+        # Optimizer step
+        optimizer.step()
+        logger.info(f"✓ Optimizer step successful")
+
+        logger.info("✓ Training loop test passed!")
+        return True
+
+    except Exception as e:
+        logger.error(f"✗ Training loop test failed: {e}")
         import traceback
         traceback.print_exc()
         return False
@@ -356,6 +505,7 @@ def main():
     results['config'] = test_config()
     results['dataset'] = test_dataset()
     results['model'] = test_model_compatibility()
+    results['training_loop'] = test_training_loop()
 
     # Check dataset (informational only)
     dataset_available = check_dataset_availability()

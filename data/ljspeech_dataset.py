@@ -14,8 +14,6 @@ import random
 import numpy as np
 from tqdm import tqdm
 
-from training.config_english import EnglishTrainingConfig as TrainingConfig
-from .english_phoneme_processor import EnglishPhonemeProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +26,9 @@ class LJSpeechDataset(Dataset):
     the LJSpeech dataset processed with Montreal Forced Aligner.
     """
 
-    def __init__(self, data_dir: str, config: TrainingConfig):
+    def __init__(self, data_dir: str, config):
+        from .english_phoneme_processor import EnglishPhonemeProcessor
+
         self.data_dir = Path(data_dir)
         self.config = config
         self.phoneme_processor = EnglishPhonemeProcessor(variant='en-us')

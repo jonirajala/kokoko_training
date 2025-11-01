@@ -57,8 +57,15 @@ class EnglishTrainingConfig:
     f_max: float = 8000.0               # Maximum frequency (Nyquist = sr/2 = 11025)
 
     # Data loading
-    num_workers: int = 2                # Number of data loading workers
+    num_workers: int = 2                # Number of data loading workers (conservative default)
+    # OPTIMIZATION: After first run, monitor GPU utilization. If GPU waits for data:
+    # - 4-8 cores: try num_workers=4
+    # - 8-16 cores: try num_workers=6
+    # - 16+ cores: try num_workers=8
+    # Note: Each worker uses ~1-2GB RAM. Monitor with: nvidia-smi dmon -s u
     pin_memory: bool = True             # Pin memory for faster GPU transfer (disable for MPS)
+    prefetch_factor: int = 3            # Number of batches to prefetch (only used if num_workers > 0)
+    persistent_workers: bool = True     # Keep workers alive between epochs (only used if num_workers > 0)
 
     # Checkpointing
     save_every: int = 1                 # Save checkpoint every N epochs
@@ -71,6 +78,9 @@ class EnglishTrainingConfig:
 
     # Mixed precision training
     use_mixed_precision: bool = True    # Enable mixed precision (fp16)
+    mixed_precision_dtype = torch.float16  # Mixed precision dtype (float16 or bfloat16)
+    # OPTIMIZATION: After first successful run, try torch.bfloat16 for more stability
+    # mixed_precision_dtype = torch.bfloat16  # Uncomment for bf16 (better stability, requires Ampere+ GPU)
     amp_init_scale: float = 65536.0     # Initial loss scale for AMP
     amp_growth_factor: float = 2.0      # Growth factor for loss scale
     amp_backoff_factor: float = 0.5     # Backoff factor for loss scale
@@ -113,16 +123,22 @@ class EnglishTrainingConfig:
 
     def __post_init__(self):
         """Post-initialization validation and adjustments"""
+        import os
+
+        # Check if we should suppress output (only during testing)
+        quiet = os.environ.get('TESTING')
 
         # Validate checkpoint segments
         if self.checkpoint_segments < 1:
             self.checkpoint_segments = 1
-            print("Warning: checkpoint_segments must be >= 1, setting to 1")
+            if not quiet:
+                print("Warning: checkpoint_segments must be >= 1, setting to 1")
 
         # Disable pin_memory for MPS (not supported)
         if self.device == "mps":
             self.pin_memory = False
-            print("Note: pin_memory disabled for MPS device")
+            if not quiet:
+                print("Note: pin_memory disabled for MPS device")
 
         # Auto-optimize checkpointing if requested
         if self.auto_optimize_checkpointing and self.gradient_checkpointing:
@@ -133,23 +149,31 @@ class EnglishTrainingConfig:
 
     def _optimize_checkpointing(self):
         """Optimize checkpoint segments based on available GPU memory"""
+        import os
+
+        quiet = os.environ.get('TESTING')
+
         device = None
         if torch.cuda.is_available():
             device = "cuda"
-            print("CUDA available, optimizing checkpointing for GPU")
+            if not quiet:
+                print("CUDA available, optimizing checkpointing for GPU")
         elif torch.backends.mps.is_available():
             device = "mps"
-            print("MPS available, optimizing checkpointing for Apple Silicon")
+            if not quiet:
+                print("MPS available, optimizing checkpointing for Apple Silicon")
         else:
-            print("No GPU acceleration available, skipping checkpointing optimization")
+            if not quiet:
+                print("No GPU acceleration available, skipping checkpointing optimization")
             return
 
         try:
             if device == "cuda":
                 # Get GPU memory info
                 total_memory_mb = torch.cuda.get_device_properties(0).total_memory / 1024**2
-                print(f"CUDA Device: {torch.cuda.get_device_name(0)}")
-                print(f"Total GPU Memory: {total_memory_mb:.1f} MB")
+                if not quiet:
+                    print(f"CUDA Device: {torch.cuda.get_device_name(0)}")
+                    print(f"Total GPU Memory: {total_memory_mb:.1f} MB")
 
                 # Estimate segments based on available memory
                 # More memory = fewer segments needed
@@ -165,17 +189,25 @@ class EnglishTrainingConfig:
             elif device == "mps":
                 # For MPS, use conservative settings
                 # MPS unified memory handling is different from CUDA
-                print("Using conservative checkpointing settings for MPS")
+                if not quiet:
+                    print("Using conservative checkpointing settings for MPS")
                 self.checkpoint_segments = 4
 
-            print(f"Optimized checkpoint_segments: {self.checkpoint_segments}")
+            if not quiet:
+                print(f"Optimized checkpoint_segments: {self.checkpoint_segments}")
 
         except Exception as e:
-            print(f"Error optimizing checkpointing: {e}")
-            print("Using default checkpoint_segments")
+            if not quiet:
+                print(f"Error optimizing checkpointing: {e}")
+                print("Using default checkpoint_segments")
 
     def _log_config(self):
         """Log important configuration details"""
+        import os
+        # Skip logging during tests
+        if os.environ.get('TESTING'):
+            return
+
         print("\n" + "="*60)
         print("English TTS Training Configuration")
         print("="*60)

@@ -474,10 +474,11 @@ class EnglishTrainer(KokoroTrainer):
             return nullcontext()
 
         if self.device_type == DeviceType.CUDA.value:
-            return torch.cuda.amp.autocast(dtype=torch.float16)
+            # Use new API: torch.amp.autocast instead of torch.cuda.amp.autocast
+            return torch.amp.autocast("cuda", dtype=torch.float16)
         elif self.device_type == DeviceType.MPS.value:
             # MPS autocast with proper torch.dtype
-            return torch.autocast(device_type='mps', dtype=torch.float16)
+            return torch.amp.autocast("mps", dtype=torch.float16)
         else:
             from contextlib import nullcontext
             return nullcontext()

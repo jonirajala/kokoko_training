@@ -6,6 +6,7 @@ Checkpoint management utilities
 import os
 import torch
 import pickle
+import json
 from pathlib import Path
 from typing import Optional, Tuple
 import logging
@@ -14,6 +15,35 @@ from .config_english import EnglishTrainingConfig as TrainingConfig
 from data.english_phoneme_processor import EnglishPhonemeProcessor
 
 logger = logging.getLogger(__name__)
+
+
+def save_model_config(config: TrainingConfig, output_dir: str):
+    """Save model configuration as JSON file for inference"""
+    config_dict = {
+        # Audio parameters
+        'sample_rate': config.sample_rate,
+        'hop_length': config.hop_length,
+        'win_length': config.win_length,
+        'n_fft': config.n_fft,
+        'n_mels': config.n_mels,
+        'f_min': config.f_min,
+        'f_max': config.f_max,
+
+        # Model architecture parameters
+        'hidden_dim': config.hidden_dim,
+        'n_encoder_layers': config.n_encoder_layers,
+        'n_decoder_layers': config.n_decoder_layers,
+        'n_heads': config.n_heads,
+        'encoder_ff_dim': config.encoder_ff_dim,
+        'decoder_ff_dim': config.decoder_ff_dim,
+        'encoder_dropout': config.encoder_dropout,
+        'max_decoder_seq_len': config.max_decoder_seq_len,
+    }
+
+    config_path = os.path.join(output_dir, "model_config.json")
+    with open(config_path, 'w') as f:
+        json.dump(config_dict, f, indent=2)
+    logger.info(f"Model config saved: {config_path}")
 
 
 def save_phoneme_processor(processor: EnglishPhonemeProcessor, output_dir: str):

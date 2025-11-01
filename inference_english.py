@@ -7,6 +7,7 @@ Convert English text to speech using trained Kokoro model with neural vocoder
 import torch
 import argparse
 import pickle
+import json
 from pathlib import Path
 from typing import List, Optional
 import logging
@@ -31,14 +32,8 @@ class KokoroEnglishTTS:
         self.device = AudioUtils.validate_device(device)
         logger.info(f"Using device: {self.device}")
 
-        # Audio configuration (should match training config)
-        self.sample_rate = 22050
-        self.hop_length = 256
-        self.win_length = 1024
-        self.n_fft = 1024
-        self.n_mels = 80
-        self.f_min = 0.0
-        self.f_max = 8000.0
+        # Load configuration from model_config.json if available
+        self._load_config()
 
         # Initialize utility classes
         self.audio_utils = AudioUtils(self.sample_rate)
@@ -51,6 +46,65 @@ class KokoroEnglishTTS:
 
         # Initialize vocoder
         self.vocoder_manager = VocoderManager(vocoder_type, vocoder_path, self.device)
+
+    def _load_config(self):
+        """Load model configuration from JSON file"""
+        config_path = self.model_dir / "model_config.json"
+
+        if config_path.exists():
+            try:
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+
+                # Audio parameters
+                self.sample_rate = config.get('sample_rate', 22050)
+                self.hop_length = config.get('hop_length', 256)
+                self.win_length = config.get('win_length', 1024)
+                self.n_fft = config.get('n_fft', 1024)
+                self.n_mels = config.get('n_mels', 80)
+                self.f_min = config.get('f_min', 0.0)
+                self.f_max = config.get('f_max', 8000.0)
+
+                # Model architecture parameters
+                self.hidden_dim = config.get('hidden_dim', 512)
+                self.n_encoder_layers = config.get('n_encoder_layers', 6)
+                self.n_decoder_layers = config.get('n_decoder_layers', 6)
+                self.n_heads = config.get('n_heads', 8)
+                self.encoder_ff_dim = config.get('encoder_ff_dim', 2048)
+                self.decoder_ff_dim = config.get('decoder_ff_dim', 2048)
+                self.encoder_dropout = config.get('encoder_dropout', 0.1)
+                self.max_decoder_seq_len = config.get('max_decoder_seq_len', 4000)
+
+                logger.info(f"Loaded model config from: {config_path}")
+            except Exception as e:
+                logger.warning(f"Error loading model config from {config_path}: {e}")
+                logger.warning("Using default configuration values")
+                self._set_default_config()
+        else:
+            logger.warning(f"Model config not found at {config_path}. Using default values.")
+            logger.warning("This may cause issues if the model was trained with different parameters!")
+            self._set_default_config()
+
+    def _set_default_config(self):
+        """Set default configuration values as fallback"""
+        # Audio configuration (defaults)
+        self.sample_rate = 22050
+        self.hop_length = 256
+        self.win_length = 1024
+        self.n_fft = 1024
+        self.n_mels = 80
+        self.f_min = 0.0
+        self.f_max = 8000.0
+
+        # Model architecture (defaults)
+        self.hidden_dim = 512
+        self.n_encoder_layers = 6
+        self.n_decoder_layers = 6
+        self.n_heads = 8
+        self.encoder_ff_dim = 2048
+        self.decoder_ff_dim = 2048
+        self.encoder_dropout = 0.1
+        self.max_decoder_seq_len = 4000
 
     def _load_phoneme_processor(self) -> EnglishPhonemeProcessor:
         """Loads the English phoneme processor from the model directory."""
@@ -117,29 +171,20 @@ class KokoroEnglishTTS:
         if state_dict_to_load is None:
             raise RuntimeError("Checkpoint does not contain a recognized model state dictionary (expected 'model_state_dict' or 'model' key, or raw state dict).")
 
-        # Define common model parameters that should match training config
-        # These values MUST correspond to the architecture the loaded model was trained with.
-        # You might want to load these from a `model_config.json` saved during training.
-        EMBED_DIM = 512
-        NUM_LAYERS = 6
-        NUM_HEADS = 8
-        FF_DIM = 2048
-        DROPOUT = 0.1
-        MAX_DECODER_SEQ_LEN = 4000 # Critical: This must match the positional encoding size used during training
-
+        # Use model parameters loaded from model_config.json
         vocab_size = len(self.phoneme_processor.phoneme_to_id)
         model = KokoroModel(
             vocab_size=vocab_size,
             mel_dim=self.n_mels,
-            hidden_dim=EMBED_DIM,
-            n_encoder_layers=NUM_LAYERS,
-            n_heads=NUM_HEADS,
-            encoder_ff_dim=FF_DIM,
-            encoder_dropout=DROPOUT,
-            n_decoder_layers=NUM_LAYERS,
-            decoder_ff_dim=FF_DIM,
-            max_decoder_seq_len=MAX_DECODER_SEQ_LEN,
-            enable_profiling= getattr(self, 'enable_profiling', False)
+            hidden_dim=self.hidden_dim,
+            n_encoder_layers=self.n_encoder_layers,
+            n_heads=self.n_heads,
+            encoder_ff_dim=self.encoder_ff_dim,
+            encoder_dropout=self.encoder_dropout,
+            n_decoder_layers=self.n_decoder_layers,
+            decoder_ff_dim=self.decoder_ff_dim,
+            max_decoder_seq_len=self.max_decoder_seq_len,
+            enable_profiling=getattr(self, 'enable_profiling', False)
         )
 
         # Filter and load state dict
