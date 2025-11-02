@@ -369,19 +369,26 @@ class EnglishTrainer(KokoroTrainer):
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                         self.optimizer.step()
 
-                # Accumulate losses
-                total_loss_epoch += total_loss.item()
-                mel_loss_epoch += loss_mel.item()
-                dur_loss_epoch += loss_duration.item()
-                stop_loss_epoch += loss_stop_token.item()
+                # Cache loss values (single .item() call per loss - no duplicate GPU syncs)
+                loss_total_val = total_loss.item()
+                loss_mel_val = loss_mel.item()
+                loss_dur_val = loss_duration.item()
+                loss_stop_val = loss_stop_token.item()
 
-                # W&B logging per batch (every 10 batches to avoid overhead)
-                if self.use_wandb and batch_idx % 10 == 0:
+                # Accumulate losses using cached values
+                total_loss_epoch += loss_total_val
+                mel_loss_epoch += loss_mel_val
+                dur_loss_epoch += loss_dur_val
+                stop_loss_epoch += loss_stop_val
+
+                # W&B logging per batch (every 50 batches to reduce queue pressure)
+                # Use commit=False to prevent blocking on queue full
+                if self.use_wandb and batch_idx % 50 == 0:
                     wandb_metrics = {
-                        "train/batch_total_loss": total_loss.item(),
-                        "train/batch_mel_loss": loss_mel.item(),
-                        "train/batch_duration_loss": loss_duration.item(),
-                        "train/batch_stop_loss": loss_stop_token.item(),
+                        "train/batch_total_loss": loss_total_val,
+                        "train/batch_mel_loss": loss_mel_val,
+                        "train/batch_duration_loss": loss_dur_val,
+                        "train/batch_stop_loss": loss_stop_val,
                         "train/learning_rate": self.optimizer.param_groups[0]['lr'],
                         "epoch": epoch + 1,
                     }
@@ -389,14 +396,15 @@ class EnglishTrainer(KokoroTrainer):
                     if self.use_mixed_precision:
                         wandb_metrics["train/grad_scale"] = self.scaler.get_scale()
 
-                    self.log_to_wandb(wandb_metrics, step=global_step)
+                    # commit=False prevents blocking on network I/O
+                    self.log_to_wandb(wandb_metrics, step=global_step, commit=False)
 
-                # Update progress bar
+                # Update progress bar using cached values
                 postfix_dict = {
-                    'total_loss': total_loss.item(),
-                    'mel_loss': loss_mel.item(),
-                    'dur_loss': loss_duration.item(),
-                    'stop_loss': loss_stop_token.item(),
+                    'total_loss': loss_total_val,
+                    'mel_loss': loss_mel_val,
+                    'dur_loss': loss_dur_val,
+                    'stop_loss': loss_stop_val,
                     'lr': self.optimizer.param_groups[0]['lr']
                 }
 
@@ -451,7 +459,8 @@ class EnglishTrainer(KokoroTrainer):
                     "memory/cleanup_overhead_percent": memory_report['cleanup_overhead_percent'],
                 })
 
-            self.log_to_wandb(wandb_metrics, step=base_global_step + num_batches)
+            # commit=True at epoch end to flush any pending logs
+            self.log_to_wandb(wandb_metrics, step=base_global_step + num_batches, commit=True)
 
         # Cleanup profiler if it was started
         if self.profiler:
