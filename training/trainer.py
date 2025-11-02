@@ -878,6 +878,9 @@ class KokoroTrainer:
 
                 progress_bar.set_postfix(postfix_dict)
 
+                # Step the learning rate scheduler after each batch
+                self.scheduler.step()
+
                 # Print memory management report periodically
                 if self.enable_adaptive_memory and batch_idx % self.memory_report_interval == 0 and batch_idx > 0:
                     logger.info(f"Memory management stats at batch {batch_idx}:")
@@ -1000,8 +1003,7 @@ class KokoroTrainer:
         for epoch in range(self.start_epoch, self.config.num_epochs):
             avg_total_loss, avg_mel_loss, avg_dur_loss, avg_stop_loss = self.train_epoch(epoch)
 
-            self.scheduler.step()
-
+            # Note: scheduler.step() is now called per batch, not per epoch
             current_lr = self.optimizer.param_groups[0]['lr']
             logger.info(f"Epoch {epoch+1} completed. "
                         f"Avg Total Loss: {avg_total_loss:.4f}, "
