@@ -95,34 +95,6 @@ LJSpeech-1.1/
     └── ...
 ```
 
-## Cloud Training (Paperspace/Colab)
-
-Setup on Paperspace:
-```bash
-cd /storage
-
-wget https://zenodo.org/records/7499098/files/LJSpeech-1.1.tar.bz2
-tar -xjf LJSpeech-1.1.tar.bz2
-
-pip install -r requirements.txt
-pip uninstall -y spacy-curated-transformers
-pip install transformers==4.35.2
-pip install "numpy<2"
-pip install "misaki[en]"
-pip install --upgrade typing-extensions
-
-wandb login
-
-python training_english.py \
-  --corpus /storage/LJSpeech-1.1 \
-  --output /storage/kokoro_english_model \
-  --batch-size 16 \
-  --no-mixed-precision \
-  --wandb
-```
-
-P4000 GPU (8GB) takes about 38 minutes per epoch with batch size 16. Full training (100 epochs) takes around 63 hours. Checkpoints are saved every 5 epochs at ~200MB each.
-
 ## Inference
 
 Basic usage:
