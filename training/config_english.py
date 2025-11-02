@@ -28,7 +28,7 @@ class EnglishTrainingConfig:
     lr_eta_min: float = 1e-6  # Minimum learning rate
 
     # Optimizer parameters
-    weight_decay: float = 0.01
+    weight_decay: float = 0.005
     adam_eps: float = 1e-8
     adam_betas: tuple = (0.9, 0.999)
 
@@ -44,8 +44,8 @@ class EnglishTrainingConfig:
     max_decoder_seq_len: int = 4000     # Maximum decoder sequence length
 
     # Loss weights
-    duration_loss_weight: float = 0.1   # Weight for duration prediction loss
-    stop_token_loss_weight: float = 1.0 # Weight for stop token loss
+    duration_loss_weight: float = 0.25  # Weight for duration prediction loss
+    stop_token_loss_weight: float = 0.5 # Weight for stop token loss
 
     # Audio processing parameters (optimized for LJSpeech)
     max_seq_length: int = 2500          # Maximum mel frame sequence length
@@ -77,15 +77,18 @@ class EnglishTrainingConfig:
     checkpoint_segments: int = 2        # Number of segments for checkpointing
     auto_optimize_checkpointing: bool = True  # Auto-optimize segments based on GPU memory
 
-    # Mixed precision training
-    use_mixed_precision: bool = True    # Enable mixed precision (fp16)
-    mixed_precision_dtype = torch.float16  # Mixed precision dtype (float16 or bfloat16)
-    # OPTIMIZATION: After first successful run, try torch.bfloat16 for more stability
-    # mixed_precision_dtype = torch.bfloat16  # Uncomment for bf16 (better stability, requires Ampere+ GPU)
-    amp_init_scale: float = 65536.0     # Initial loss scale for AMP
-    amp_growth_factor: float = 2.0      # Growth factor for loss scale
-    amp_backoff_factor: float = 0.5     # Backoff factor for loss scale
-    amp_growth_interval: int = 2000     # Steps between scale increases
+    # Mixed precision training (auto-detects best dtype)
+    use_mixed_precision: bool = True    # Enable mixed precision training
+    mixed_precision_dtype = torch.bfloat16  # Preferred dtype (auto-falls back to fp16 if bf16 unsupported)
+    # AUTOMATIC BEHAVIOR:
+    # - CUDA: Auto-detects BF16 support (Ampere+), falls back to FP16 on older GPUs
+    # - MPS: Uses config dtype (BF16 or FP16)
+    # - BF16: No GradScaler needed (inherently stable)
+    # - FP16: Conservative GradScaler enabled automatically (init_scale=4096)
+    amp_init_scale: float = 2**12       # Initial loss scale for FP16 (4096, conservative)
+    amp_growth_factor: float = 2.0      # Growth factor for loss scale (FP16 only)
+    amp_backoff_factor: float = 0.5     # Backoff factor for loss scale (FP16 only)
+    amp_growth_interval: int = 1000     # Steps between scale increases (FP16 only)
 
     # Gradient clipping
     max_grad_norm: float = 1.0          # Maximum gradient norm for clipping

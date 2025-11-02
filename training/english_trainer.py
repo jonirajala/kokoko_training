@@ -58,13 +58,13 @@ class EnglishTrainer(KokoroTrainer):
                 # growth_factor=2.0 doubles scale when increasing
                 # backoff_factor=0.5 halves scale on overflow
                 self.scaler = torch.cuda.amp.GradScaler(
-                    init_scale=2**16,          # Start at 65536
+                    init_scale=2**12,          # Start at 4096
                     growth_factor=2.0,         # Double on success
                     backoff_factor=0.5,        # Halve on overflow
                     growth_interval=2000,      # Update every 2000 steps
                     enabled=True
                 )
-                self.max_grad_scale = 2**17    # Cap at 131072 to prevent explosion
+                self.max_grad_scale = 2**15    # Cap at 32768 to prevent explosion
                 self.device_type = 'cuda'
                 logger.info(f"Mixed precision training enabled with CUDA GradScaler (max_scale={self.max_grad_scale})")
             elif self.device.type == DeviceType.MPS.value:

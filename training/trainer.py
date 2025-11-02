@@ -67,50 +67,88 @@ class KokoroTrainer:
         self.config = config
         self.device = torch.device(config.device)
 
+        # Enable TF32 for peak performance on Ampere+ GPUs
+        # TF32 uses tensor cores efficiently for matmul operations
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+            logger.info("TF32 tensor cores enabled for CUDA operations")
+
         # Initialize adaptive memory manager
         self.memory_manager = AdaptiveMemoryManager(self.device, config)
 
-        # Initialize mixed precision training components
+        # Initialize mixed precision training components with automatic BF16/FP16 detection
         self.use_mixed_precision = getattr(config, 'use_mixed_precision', True)
-        self.mixed_precision_dtype = getattr(config, 'mixed_precision_dtype', torch.float16)
 
-        # Check device support for mixed precision
-        if self.use_mixed_precision:
-            if self.device.type == DeviceType.CUDA.value:
-                self.scaler = torch.cuda.amp.GradScaler(
-                    init_scale=getattr(config, 'amp_init_scale', 65536.0),
-                    growth_factor=getattr(config, 'amp_growth_factor', 2.0),
-                    backoff_factor=getattr(config, 'amp_backoff_factor', 0.5),
-                    growth_interval=getattr(config, 'amp_growth_interval', 2000)
-                )
+        if self.use_mixed_precision and self.device.type == DeviceType.CUDA.value:
+            # Auto-detect best dtype for CUDA devices
+            if torch.cuda.is_bf16_supported():
+                # ✅ Prefer BF16 on modern GPUs (Ampere/Ada/Hopper)
+                self.autocast_dtype = torch.bfloat16
+                self.scaler = None  # No GradScaler needed for BF16
+                self.use_grad_scaler = False
                 self.device_type = 'cuda'
-                logger.info("Mixed precision training enabled with CUDA GradScaler")
-
-            elif self.device.type == DeviceType.MPS.value:
-                if check_mps_mixed_precision_support():
-                    self.scaler = MPSGradScaler(
-                        init_scale=getattr(config, 'amp_init_scale', 65536.0),
-                        growth_factor=getattr(config, 'amp_growth_factor', 2.0),
-                        backoff_factor=getattr(config, 'amp_backoff_factor', 0.5),
-                        growth_interval=getattr(config, 'amp_growth_interval', 2000)
-                    )
-                    self.device_type = DeviceType.MPS.value
-                    logger.info("Mixed precision training enabled with MPS custom scaler")
-                else:
-                    logger.warning("MPS mixed precision not supported, disabling mixed precision")
-                    self.use_mixed_precision = False
-                    self.scaler = None
-                    self.device_type = DeviceType.MPS.value
-
+                logger.info("✓ Using bfloat16 autocast on CUDA (no GradScaler needed)")
+                logger.info("  GPU supports BF16 - optimal stability without scaling")
             else:
-                logger.info(f"Mixed precision not supported on {self.device.type}, disabling")
+                # Fallback to FP16 with conservative GradScaler for older GPUs
+                self.autocast_dtype = torch.float16
+                self.scaler = torch.cuda.amp.GradScaler(
+                    init_scale=2**12,  # Conservative initial scale (4096)
+                    growth_factor=2.0,
+                    backoff_factor=0.5,
+                    growth_interval=1000,
+                    enabled=True
+                )
+                self.use_grad_scaler = True
+                self.max_grad_scale = 2**15  # Maximum scale limit (32768)
+                self.device_type = 'cuda'
+                logger.info("✓ Using float16 autocast on CUDA with GradScaler fallback")
+                logger.info("  GPU does not support BF16 - using FP16 with conservative scaling")
+
+        elif self.use_mixed_precision and self.device.type == DeviceType.MPS.value:
+            # MPS (Apple Silicon) handling
+            if check_mps_mixed_precision_support():
+                # Try to use config dtype, default to FP16 for MPS
+                config_dtype = getattr(config, 'mixed_precision_dtype', torch.float16)
+
+                if config_dtype == torch.bfloat16:
+                    self.autocast_dtype = torch.bfloat16
+                    self.scaler = None
+                    self.use_grad_scaler = False
+                    logger.info("✓ Using bfloat16 autocast on MPS (no scaler needed)")
+                else:
+                    self.autocast_dtype = torch.float16
+                    self.scaler = MPSGradScaler(
+                        init_scale=2**12,
+                        growth_factor=2.0,
+                        backoff_factor=0.5,
+                        growth_interval=1000
+                    )
+                    self.use_grad_scaler = True
+                    logger.info("✓ Using float16 autocast on MPS with custom scaler")
+
+                self.device_type = DeviceType.MPS.value
+            else:
+                logger.warning("MPS mixed precision not supported, disabling mixed precision")
                 self.use_mixed_precision = False
                 self.scaler = None
-                self.device_type = self.device.type
+                self.use_grad_scaler = False
+                self.autocast_dtype = torch.float32
+                self.device_type = DeviceType.MPS.value
+
         else:
+            # CPU or mixed precision disabled
+            self.use_mixed_precision = False
             self.scaler = None
+            self.use_grad_scaler = False
+            self.autocast_dtype = torch.float32
             self.device_type = self.device.type
-            logger.info("Mixed precision training disabled by configuration")
+            if self.device.type == DeviceType.CUDA.value or self.device.type == DeviceType.MPS.value:
+                logger.info("Mixed precision training disabled by configuration")
+            else:
+                logger.info(f"Mixed precision not supported on {self.device.type}, using FP32")
 
         # Initialize dataset (LJSpeech for English)
         self.dataset = LJSpeechDataset(config.data_dir, config)
@@ -197,16 +235,11 @@ class KokoroTrainer:
 
     def get_autocast_context(self):
         """Get the appropriate autocast context for the device"""
+        import torch
         if not self.use_mixed_precision:
-            return torch.no_grad().__enter__()  # No-op context
-
-        if self.device_type == DeviceType.CUDA.value:
-            # Use new API: torch.amp.autocast instead of torch.cuda.amp.autocast
-            return torch.amp.autocast('cuda', dtype=self.mixed_precision_dtype)
-        elif self.device_type == DeviceType.MPS.value:
-            return torch.amp.autocast('mps', dtype=self.mixed_precision_dtype)
-        else:
-            return torch.no_grad().__enter__()  # No-op context
+            from contextlib import nullcontext
+            return nullcontext()
+        return torch.amp.autocast("cuda", dtype=self.autocast_dtype)
 
     def adaptive_memory_cleanup(self, batch_idx: int, force: bool = False) -> Dict[str, Any]:
         """Perform adaptive memory cleanup"""
@@ -559,35 +592,47 @@ class KokoroTrainer:
     def _calculate_losses(self, predicted_mel, predicted_log_durations, predicted_stop_logits,
                          mel_specs, phoneme_durations, stop_token_targets,
                          mel_lengths, phoneme_lengths):
-        """Calculate losses with masking (extracted for reuse)"""
-        # Mel Spectrogram Loss
+        """Numerically stable loss calculation with masking."""
+        eps = 1e-8
+
+        # --- Mel Spectrogram Loss ---
         max_mel_len_batch = mel_specs.size(1)
-        mel_mask = torch.arange(max_mel_len_batch, device=self.device).expand(
-            len(mel_lengths), max_mel_len_batch) < mel_lengths.unsqueeze(1)
+        mel_mask = (torch.arange(max_mel_len_batch, device=self.device)
+                    .expand(len(mel_lengths), max_mel_len_batch)
+                    < mel_lengths.unsqueeze(1))
         mel_mask = mel_mask.unsqueeze(-1).expand_as(predicted_mel).float()
 
         loss_mel_unreduced = self.criterion_mel(predicted_mel, mel_specs)
-        loss_mel = (loss_mel_unreduced * mel_mask).sum() / mel_mask.sum()
+        loss_mel = (loss_mel_unreduced * mel_mask).sum() / (mel_mask.sum() + eps)
 
-        # Duration Loss
+        # --- Duration Loss ---
         max_phoneme_len_batch = phoneme_durations.size(1)
-        phoneme_mask = torch.arange(max_phoneme_len_batch, device=self.device).expand(
-            len(phoneme_lengths), max_phoneme_len_batch) < phoneme_lengths.unsqueeze(1)
-        phoneme_mask = phoneme_mask.float()
+        phoneme_mask = (torch.arange(max_phoneme_len_batch, device=self.device)
+                        .expand(len(phoneme_lengths), max_phoneme_len_batch)
+                        < phoneme_lengths.unsqueeze(1)).float()
 
-        target_log_durations = torch.log(phoneme_durations.float() + 1e-5)
-        loss_duration_unreduced = self.criterion_duration(predicted_log_durations, target_log_durations)
-        loss_duration = (loss_duration_unreduced * phoneme_mask).sum() / phoneme_mask.sum()
+        # Safe log of durations
+        target_log_durations = torch.log(phoneme_durations.float().clamp(min=1e-5))
+        loss_duration_unreduced = self.criterion_duration(
+            predicted_log_durations.float(), target_log_durations
+        )
+        loss_duration = (loss_duration_unreduced * phoneme_mask).sum() / (phoneme_mask.sum() + eps)
 
-        # Stop Token Loss
+        # --- Stop Token Loss ---
         stop_token_mask = mel_mask[:, :, 0]
-        loss_stop_token_unreduced = self.criterion_stop_token(predicted_stop_logits, stop_token_targets)
-        loss_stop_token = (loss_stop_token_unreduced * stop_token_mask).sum() / stop_token_mask.sum()
+        # Force FP32 for BCE loss to avoid numerical issues
+        with torch.cuda.amp.autocast(enabled=False):
+            loss_stop_token_unreduced = self.criterion_stop_token(
+                predicted_stop_logits.float(), stop_token_targets.float()
+            )
+        loss_stop_token = (loss_stop_token_unreduced * stop_token_mask).sum() / (stop_token_mask.sum() + eps)
 
-        # Combine all losses
-        total_loss = (loss_mel +
-                     loss_duration * self.config.duration_loss_weight +
-                     loss_stop_token * self.config.stop_token_loss_weight)
+        # --- Combine ---
+        total_loss = (
+            loss_mel +
+            loss_duration * self.config.duration_loss_weight +
+            loss_stop_token * self.config.stop_token_loss_weight
+        )
 
         return total_loss, loss_mel, loss_duration, loss_stop_token
 
@@ -614,8 +659,8 @@ class KokoroTrainer:
             checkpoint_path, self.model, self.optimizer, self.scheduler, self.config.output_dir
         )
 
-        # Load scaler state if available
-        if self.use_mixed_precision and self.scaler:
+        # Load scaler state if available (only for FP16)
+        if self.use_grad_scaler and self.scaler:
             try:
                 checkpoint = torch.load(checkpoint_path, map_location=self.device)
                 if 'scaler' in checkpoint:
@@ -645,7 +690,8 @@ class KokoroTrainer:
             'config': self.config,
         }
 
-        if self.use_mixed_precision and self.scaler:
+        # Only save scaler state if using FP16 (BF16 doesn't need scaler)
+        if self.use_grad_scaler and self.scaler:
             checkpoint['scaler'] = self.scaler.state_dict()
             checkpoint['device_type'] = self.device_type  # Store device type for proper restoration
 
@@ -775,76 +821,82 @@ class KokoroTrainer:
                 if is_profiling_epoch:
                     self.log_memory_stats("loss_calculation")
 
-                # Backward pass with mixed precision and interbatch profiling
+                # Non-finite loss check (stability guard)
+                if not torch.isfinite(total_loss):
+                    logger.warning(f"[Batch {batch_idx}] Non-finite loss detected. Skipping batch.")
+                    self.optimizer.zero_grad(set_to_none=True)
+                    continue
+
+                # Backward pass with interbatch profiling
                 if enable_interbatch_profiling or is_profiling_epoch:
                     self.interbatch_profiler.start_backward_pass()
 
+                # ========== Backward + Optimizer Step (Simplified) ==========
                 with torch.profiler.record_function("Backward_Pass"):
-                    if self.use_mixed_precision:
-                        if self.device_type == 'cuda':
-                            self.scaler.scale(total_loss).backward()
-                        else:  # MPS
-                            scaled_loss = self.scaler.scale(total_loss)
-                            scaled_loss.backward()
-                    else:
+                    if self.use_mixed_precision and self.autocast_dtype == torch.bfloat16:
+                        # ✅ BF16 path (no GradScaler needed - inherently stable)
+                        self.optimizer.zero_grad(set_to_none=True)
                         total_loss.backward()
+                        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+
+                        if not torch.isfinite(grad_norm):
+                            logger.warning(f"[Batch {batch_idx}] Non-finite grad norm ({grad_norm:.2f}). Skipping batch.")
+                            self.optimizer.zero_grad(set_to_none=True)
+                            continue
+
+                        self.optimizer.step()
+                        self.mixed_precision_stats['successful_steps'] += 1
+
+                    elif self.use_mixed_precision and self.use_grad_scaler:
+                        # FP16 path with GradScaler (backward compatibility)
+                        self.scaler.scale(total_loss).backward()
+                        self.scaler.unscale_(self.optimizer)
+                        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+
+                        if not torch.isfinite(grad_norm):
+                            logger.warning(f"[Batch {batch_idx}] Non-finite grad norm ({grad_norm:.2f}). Skipping batch.")
+                            self.optimizer.zero_grad(set_to_none=True)
+                            self.scaler.update()
+                            continue
+
+                        self.scaler.step(self.optimizer)
+                        old_scale = self.scaler.get_scale()
+                        self.scaler.update()
+                        new_scale = self.scaler.get_scale()
+
+                        # Cap grad scale if needed (prevent unbounded growth)
+                        if hasattr(self, 'max_grad_scale') and self.max_grad_scale is not None and new_scale > self.max_grad_scale:
+                            try:
+                                self.scaler._scale.fill_(self.max_grad_scale)
+                                if batch_idx % 500 == 0:
+                                    logger.info(f"Grad scale capped at {self.max_grad_scale} (was {float(new_scale):.0f})")
+                            except Exception:
+                                logger.warning("GradScaler._scale cap failed (internal API change)")
+
+                        # Update mixed precision stats
+                        if new_scale != old_scale:
+                            self.mixed_precision_stats['scale_updates'] += 1
+                            if new_scale < old_scale:
+                                self.mixed_precision_stats['scale_decreases'] += 1
+                                self.mixed_precision_stats['overflow_count'] += 1
+                            else:
+                                self.mixed_precision_stats['successful_steps'] += 1
+                        else:
+                            self.mixed_precision_stats['successful_steps'] += 1
+
+                    else:
+                        # FP32 fallback (no mixed precision)
+                        self.optimizer.zero_grad(set_to_none=True)
+                        total_loss.backward()
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                        self.optimizer.step()
+                        self.mixed_precision_stats['successful_steps'] += 1
 
                 if enable_interbatch_profiling or is_profiling_epoch:
                     self.interbatch_profiler.end_backward_pass()
 
                 if is_profiling_epoch:
                     self.log_memory_stats("backward_pass")
-
-                # Optimizer step with mixed precision
-                with torch.profiler.record_function("Optimizer_Step"):
-                    if self.use_mixed_precision:
-                        if self.device_type == 'cuda':
-                            # CUDA path with built-in GradScaler
-                            self.scaler.unscale_(self.optimizer)
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
-                            old_scale = self.scaler.get_scale()
-                            self.scaler.step(self.optimizer)
-                            self.scaler.update()
-                            new_scale = self.scaler.get_scale()
-
-                            # Update mixed precision stats
-                            if new_scale != old_scale:
-                                self.mixed_precision_stats['scale_updates'] += 1
-                                if new_scale < old_scale:
-                                    self.mixed_precision_stats['scale_decreases'] += 1
-                                    self.mixed_precision_stats['overflow_count'] += 1
-                                else:
-                                    self.mixed_precision_stats['successful_steps'] += 1
-                            else:
-                                self.mixed_precision_stats['successful_steps'] += 1
-
-                        else:  # MPS path with custom scaler
-                            # For MPS, clip gradients before unscaling
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
-                            old_scale = self.scaler.get_scale()
-                            step_successful = self.scaler.step(self.optimizer)
-                            self.scaler.update()
-                            new_scale = self.scaler.get_scale()
-
-                            # Update mixed precision stats
-                            if step_successful:
-                                self.mixed_precision_stats['successful_steps'] += 1
-                            else:
-                                self.mixed_precision_stats['skipped_steps'] += 1
-                                self.mixed_precision_stats['overflow_count'] += 1
-
-                            if new_scale != old_scale:
-                                self.mixed_precision_stats['scale_updates'] += 1
-                                if new_scale < old_scale:
-                                    self.mixed_precision_stats['scale_decreases'] += 1
-                    else:
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                        self.optimizer.step()
-
-                if is_profiling_epoch:
-                    self.log_memory_stats("optimizer_step")
 
                 # End batch profiling
                 if enable_interbatch_profiling or is_profiling_epoch:
@@ -866,7 +918,10 @@ class KokoroTrainer:
                 }
 
                 if self.use_mixed_precision:
-                    postfix_dict['scale'] = f"{self.scaler.get_scale():.0f}"
+                    if self.use_grad_scaler and self.scaler:
+                        postfix_dict['scale'] = f"{self.scaler.get_scale():.0f}"
+                    else:
+                        postfix_dict['dtype'] = 'bf16'
                     if self.device_type == DeviceType.MPS.value:
                         postfix_dict['device'] = 'MPS'
 
@@ -947,8 +1002,8 @@ class KokoroTrainer:
                 logger.info(f"Mixed Precision Stats {device_info} - Success: {mp_stats['successful_steps']}, "
                            f"Skipped: {mp_stats.get('skipped_steps', 0)}, "
                            f"Overflows: {mp_stats['overflow_count']}, "
-                           f"Success Rate: {success_rate:.1f}%, "
-                           f"Current Scale: {self.scaler.get_scale():.0f}")
+                           f"Success Rate: {success_rate:.1f}%"
+                           + (f", Current Scale: {self.scaler.get_scale():.0f}" if self.scaler else ""))
 
         return (total_loss_epoch / num_batches,
                 mel_loss_epoch / num_batches,
@@ -1022,13 +1077,8 @@ class KokoroTrainer:
                 logger.info(f"  Cleanup Overhead: {memory_report['cleanup_overhead_percent']:.2f}%")
 
             if (epoch + 1) % self.config.save_every == 0:
-                if self.use_mixed_precision:
-                    self.save_checkpoint_with_scaler(epoch, avg_total_loss)
-                else:
-                    save_checkpoint(
-                        self.model, self.optimizer, self.scheduler,
-                        epoch, avg_total_loss, self.config, self.config.output_dir
-                    )
+                # save_checkpoint_with_scaler handles both FP16 (with scaler) and BF16/FP32 (without scaler)
+                self.save_checkpoint_with_scaler(epoch, avg_total_loss)
                 logger.info(f"Checkpoint saved for epoch {epoch+1}")
 
             # Strategic memory cleanup at epoch end
@@ -1135,70 +1185,70 @@ class KokoroTrainer:
 
                 self.log_memory_stats("loss_calculation")
 
-                # Backward pass with mixed precision
+                # Backward pass with profiling
                 self.interbatch_profiler.start_backward_pass()
+
+                # ========== Backward + Optimizer Step (Simplified) ==========
                 with torch.profiler.record_function("Backward_Pass"):
-                    if self.use_mixed_precision:
-                        if self.device_type == DeviceType.CUDA.value:
-                            self.scaler.scale(total_loss).backward()
-                        else:  # MPS
-                            scaled_loss = self.scaler.scale(total_loss)
-                            scaled_loss.backward()
-                    else:
+                    if self.use_mixed_precision and self.autocast_dtype == torch.bfloat16:
+                        # ✅ BF16 path (no GradScaler needed - inherently stable)
+                        self.optimizer.zero_grad(set_to_none=True)
                         total_loss.backward()
-                self.interbatch_profiler.end_backward_pass()
+                        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
 
-                self.log_memory_stats("backward_pass")
+                        if not torch.isfinite(grad_norm):
+                            logger.warning(f"[Profiling Step {step_count}] Non-finite grad norm ({grad_norm:.2f}). Skipping batch.")
+                            self.optimizer.zero_grad(set_to_none=True)
+                            continue
 
-                # Optimizer step with mixed precision
-                with torch.profiler.record_function("Optimizer_Step"):
-                    if self.use_mixed_precision:
-                        if self.device_type == 'cuda':
-                            # CUDA path with built-in GradScaler
-                            self.scaler.unscale_(self.optimizer)
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
-                            old_scale = self.scaler.get_scale()
-                            self.scaler.step(self.optimizer)
-                            self.scaler.update()
-                            new_scale = self.scaler.get_scale()
-
-                            # Update mixed precision stats
-                            if new_scale != old_scale:
-                                self.mixed_precision_stats['scale_updates'] += 1
-                                if new_scale < old_scale:
-                                    self.mixed_precision_stats['scale_decreases'] += 1
-                                    self.mixed_precision_stats['overflow_count'] += 1
-                                else:
-                                    self.mixed_precision_stats['successful_steps'] += 1
-                            else:
-                                self.mixed_precision_stats['successful_steps'] += 1
-
-                        else:  # MPS path with custom scaler
-                            # Clip gradients before unscaling for MPS
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
-                            old_scale = self.scaler.get_scale()
-                            step_successful = self.scaler.step(self.optimizer)
-                            self.scaler.update()
-                            new_scale = self.scaler.get_scale()
-
-                            # Update mixed precision stats
-                            if step_successful:
-                                self.mixed_precision_stats['successful_steps'] += 1
-                            else:
-                                self.mixed_precision_stats['skipped_steps'] += 1
-                                self.mixed_precision_stats['overflow_count'] += 1
-
-                            if new_scale != old_scale:
-                                self.mixed_precision_stats['scale_updates'] += 1
-                                if new_scale < old_scale:
-                                    self.mixed_precision_stats['scale_decreases'] += 1
-                    else:
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                         self.optimizer.step()
+                        self.mixed_precision_stats['successful_steps'] += 1
 
-                self.log_memory_stats("optimizer_step")
+                    elif self.use_mixed_precision and self.use_grad_scaler:
+                        # FP16 path with GradScaler (backward compatibility)
+                        self.scaler.scale(total_loss).backward()
+                        self.scaler.unscale_(self.optimizer)
+                        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+
+                        if not torch.isfinite(grad_norm):
+                            logger.warning(f"[Profiling Step {step_count}] Non-finite grad norm ({grad_norm:.2f}). Skipping batch.")
+                            self.optimizer.zero_grad(set_to_none=True)
+                            self.scaler.update()
+                            continue
+
+                        self.scaler.step(self.optimizer)
+                        old_scale = self.scaler.get_scale()
+                        self.scaler.update()
+                        new_scale = self.scaler.get_scale()
+
+                        # Cap grad scale if needed
+                        if hasattr(self, 'max_grad_scale') and self.max_grad_scale is not None and new_scale > self.max_grad_scale:
+                            try:
+                                self.scaler._scale.fill_(self.max_grad_scale)
+                            except Exception:
+                                pass  # Ignore during profiling
+
+                        # Update mixed precision stats
+                        if new_scale != old_scale:
+                            self.mixed_precision_stats['scale_updates'] += 1
+                            if new_scale < old_scale:
+                                self.mixed_precision_stats['scale_decreases'] += 1
+                                self.mixed_precision_stats['overflow_count'] += 1
+                            else:
+                                self.mixed_precision_stats['successful_steps'] += 1
+                        else:
+                            self.mixed_precision_stats['successful_steps'] += 1
+
+                    else:
+                        # FP32 fallback (no mixed precision)
+                        self.optimizer.zero_grad(set_to_none=True)
+                        total_loss.backward()
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                        self.optimizer.step()
+                        self.mixed_precision_stats['successful_steps'] += 1
+
+                self.interbatch_profiler.end_backward_pass()
+                self.log_memory_stats("backward_pass")
 
                 # End batch profiling
                 batch_size = mel_specs.size(0)
