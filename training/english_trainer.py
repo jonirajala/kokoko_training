@@ -52,20 +52,35 @@ class EnglishTrainer(KokoroTrainer):
         import torch
         if self.use_mixed_precision:
             if self.device.type == DeviceType.CUDA.value:
-                self.scaler = torch.cuda.amp.GradScaler()
+                # Initialize GradScaler with controlled growth and max scale cap
+                # growth_interval=2000 means scale only increases every 2000 successful steps
+                # init_scale=2**16 is a good starting point (65536)
+                # growth_factor=2.0 doubles scale when increasing
+                # backoff_factor=0.5 halves scale on overflow
+                self.scaler = torch.cuda.amp.GradScaler(
+                    init_scale=2**16,          # Start at 65536
+                    growth_factor=2.0,         # Double on success
+                    backoff_factor=0.5,        # Halve on overflow
+                    growth_interval=2000,      # Update every 2000 steps
+                    enabled=True
+                )
+                self.max_grad_scale = 2**17    # Cap at 131072 to prevent explosion
                 self.device_type = 'cuda'
-                logger.info("Mixed precision training enabled with CUDA GradScaler")
+                logger.info(f"Mixed precision training enabled with CUDA GradScaler (max_scale={self.max_grad_scale})")
             elif self.device.type == DeviceType.MPS.value:
                 from .mps_grad_scaler import MPSGradScaler
                 self.scaler = MPSGradScaler()
+                self.max_grad_scale = None  # MPS scaler handles this differently
                 self.device_type = DeviceType.MPS.value
                 logger.info("Mixed precision training enabled with MPS custom scaler")
             else:
                 self.use_mixed_precision = False
                 self.scaler = None
+                self.max_grad_scale = None
                 self.device_type = self.device.type
         else:
             self.scaler = None
+            self.max_grad_scale = None
             self.device_type = self.device.type
 
         # NOW create our English dataset
@@ -360,7 +375,17 @@ class EnglishTrainer(KokoroTrainer):
                             self.scaler.unscale_(self.optimizer)
                             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                             self.scaler.step(self.optimizer)
+
+                            # Cap the gradient scale to prevent explosion
+                            old_scale = self.scaler.get_scale()
                             self.scaler.update()
+                            new_scale = self.scaler.get_scale()
+
+                            # If scale exceeded max, manually set it back
+                            if self.max_grad_scale is not None and new_scale > self.max_grad_scale:
+                                self.scaler._scale.fill_(self.max_grad_scale)
+                                if batch_idx % 500 == 0:
+                                    logger.info(f"Gradient scale capped at {self.max_grad_scale} (was {new_scale:.0f})")
                         else:
                             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                             self.scaler.step(self.optimizer)
