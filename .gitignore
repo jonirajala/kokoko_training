@@ -52,8 +52,7 @@ kokoro_english_model/
 *.pkl
 *.ckpt
 
-# Audio files
-audio/
+# Audio files (not the audio/ module directory)
 *.wav
 *.mp3
 *.flac
