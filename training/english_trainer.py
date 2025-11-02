@@ -134,9 +134,19 @@ class EnglishTrainer(KokoroTrainer):
         self.criterion_stop_token = nn.BCEWithLogitsLoss(reduction='none')
 
         # Learning rate scheduler
+        # Convert T_0 from epochs to batches since we call scheduler.step() per batch
+        num_batches_per_epoch = len(self.dataloader)
+        T_0_epochs = getattr(config, 'lr_T_0', 20)
+        T_0_batches = T_0_epochs * num_batches_per_epoch
+
+        logger.info(f"Learning rate scheduler: CosineAnnealingWarmRestarts")
+        logger.info(f"  T_0: {T_0_epochs} epochs = {T_0_batches} batches")
+        logger.info(f"  T_mult: {getattr(config, 'lr_T_mult', 2)}")
+        logger.info(f"  eta_min: {getattr(config, 'lr_eta_min', 1e-6)}")
+
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             self.optimizer,
-            T_0=getattr(config, 'lr_T_0', 20),
+            T_0=T_0_batches,
             T_mult=getattr(config, 'lr_T_mult', 2),
             eta_min=getattr(config, 'lr_eta_min', 1e-6)
         )
@@ -399,6 +409,9 @@ class EnglishTrainer(KokoroTrainer):
                         postfix_dict['mem'] += '*'
 
                 progress_bar.set_postfix(postfix_dict)
+
+                # Step the learning rate scheduler after each batch
+                self.scheduler.step()
 
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():

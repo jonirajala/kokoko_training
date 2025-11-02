@@ -878,8 +878,8 @@ class KokoroTrainer:
 
                 progress_bar.set_postfix(postfix_dict)
 
-                # Step the learning rate scheduler after each batch
-                self.scheduler.step()
+                # Note: scheduler.step() should be called per batch in subclasses
+                # EnglishTrainer overrides train_epoch and handles scheduler there
 
                 # Print memory management report periodically
                 if self.enable_adaptive_memory and batch_idx % self.memory_report_interval == 0 and batch_idx > 0:
