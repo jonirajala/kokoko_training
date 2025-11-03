@@ -57,7 +57,6 @@ class EnglishTrainer:
             if torch.cuda.is_bf16_supported():
                 # ✅ Prefer BF16 on modern GPUs (Ampere/Ada/Hopper)
                 self.autocast_dtype = torch.bfloat16
-                self.mixed_precision_dtype = torch.bfloat16
                 self.scaler = None  # No GradScaler needed for BF16
                 self.device_type = 'cuda'
                 logger.info("✓ Using bfloat16 autocast on CUDA (no GradScaler needed)")
@@ -65,7 +64,6 @@ class EnglishTrainer:
             else:
                 # Fallback to FP16 with conservative GradScaler for older GPUs
                 self.autocast_dtype = torch.float16
-                self.mixed_precision_dtype = torch.float16
                 self.scaler = torch.cuda.amp.GradScaler(
                     init_scale=2**12,  # Conservative initial scale (4096)
                     growth_factor=2.0,
@@ -83,12 +81,10 @@ class EnglishTrainer:
             config_dtype = getattr(config, 'mixed_precision_dtype', torch.float16)
             if config_dtype == torch.bfloat16:
                 self.autocast_dtype = torch.bfloat16
-                self.mixed_precision_dtype = torch.bfloat16
                 self.scaler = None
                 logger.info("✓ Using bfloat16 autocast on MPS (no scaler needed)")
             else:
                 self.autocast_dtype = torch.float16
-                self.mixed_precision_dtype = torch.float16
                 self.scaler = MPSGradScaler(
                     init_scale=2**12,
                     growth_factor=2.0,
@@ -103,7 +99,6 @@ class EnglishTrainer:
             self.use_mixed_precision = False
             self.scaler = None
             self.autocast_dtype = torch.float32
-            self.mixed_precision_dtype = torch.float32
             self.device_type = self.device.type
             if self.device.type == DeviceType.CUDA.value or self.device.type == DeviceType.MPS.value:
                 logger.info("Mixed precision training disabled by configuration")
@@ -535,7 +530,7 @@ class EnglishTrainer:
             logger.info(f"Starting training on device: {self.device} ({self.device_type})")
             logger.info(f"Mixed precision training: {'Enabled' if self.use_mixed_precision else 'Disabled'}")
             if self.use_mixed_precision:
-                logger.info(f"Mixed precision dtype: {self.mixed_precision_dtype}")
+                logger.info(f"Mixed precision dtype: {self.autocast_dtype}")
                 if self.device_type == DeviceType.MPS.value:
                     logger.info("Using custom MPS gradient scaler (experimental)")
             logger.info(f"Adaptive memory management: {'Enabled' if self.enable_adaptive_memory else 'Disabled'}")
@@ -882,7 +877,7 @@ class EnglishTrainer:
                 'device_available': self._is_device_available(),
                 'device_type': self.device.type,
                 'mixed_precision_enabled': self.use_mixed_precision,
-                'mixed_precision_dtype': str(self.mixed_precision_dtype) if self.use_mixed_precision else None
+                'mixed_precision_dtype': str(self.autocast_dtype) if self.use_mixed_precision else None
             }
         }
         self.memory_snapshots = []
