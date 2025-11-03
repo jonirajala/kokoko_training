@@ -459,7 +459,8 @@ class EnglishTrainer(KokoroTrainer):
                         "epoch": epoch + 1,
                     }
 
-                    if self.use_mixed_precision:
+                    # Only log grad_scale if using FP16 with GradScaler
+                    if self.use_mixed_precision and self.use_grad_scaler and self.scaler:
                         wandb_metrics["train/grad_scale"] = self.scaler.get_scale()
 
                     # commit=False prevents blocking on network I/O
