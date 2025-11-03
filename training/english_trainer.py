@@ -387,40 +387,52 @@ class EnglishTrainer(KokoroTrainer):
                         )
 
                 # Backward pass
+                # ========== Backward + Optimizer Step (Simplified) ==========
                 with torch.profiler.record_function("Backward_Pass"):
-                    if self.use_mixed_precision:
-                        if self.device_type == 'cuda':
-                            self.scaler.scale(total_loss).backward()
-                        else:
-                            scaled_loss = self.scaler.scale(total_loss)
-                            scaled_loss.backward()
-                    else:
+                    if self.use_mixed_precision and self.autocast_dtype == torch.bfloat16:
+                        # ✅ BF16 path (no GradScaler needed - inherently stable)
+                        self.optimizer.zero_grad(set_to_none=True)
                         total_loss.backward()
+                        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
 
-                # Optimizer step
-                with torch.profiler.record_function("Optimizer_Step"):
-                    if self.use_mixed_precision:
-                        if self.device_type == 'cuda':
-                            self.scaler.unscale_(self.optimizer)
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                            self.scaler.step(self.optimizer)
+                        if not torch.isfinite(grad_norm):
+                            logger.warning(f"[Batch {batch_idx}] Non-finite grad norm ({grad_norm:.2f}). Skipping batch.")
+                            self.optimizer.zero_grad(set_to_none=True)
+                            continue
 
-                            # Cap the gradient scale to prevent explosion
-                            old_scale = self.scaler.get_scale()
+                        self.optimizer.step()
+
+                    elif self.use_mixed_precision and self.use_grad_scaler:
+                        # FP16 path with GradScaler (backward compatibility)
+                        self.scaler.scale(total_loss).backward()
+                        self.scaler.unscale_(self.optimizer)
+                        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+
+                        if not torch.isfinite(grad_norm):
+                            logger.warning(f"[Batch {batch_idx}] Non-finite grad norm ({grad_norm:.2f}). Skipping batch.")
+                            self.optimizer.zero_grad(set_to_none=True)
                             self.scaler.update()
-                            new_scale = self.scaler.get_scale()
+                            continue
 
-                            # If scale exceeded max, manually set it back
-                            if self.max_grad_scale is not None and new_scale > self.max_grad_scale:
+                        self.scaler.step(self.optimizer)
+                        old_scale = self.scaler.get_scale()
+                        self.scaler.update()
+                        new_scale = self.scaler.get_scale()
+
+                        # Cap grad scale if needed (prevent unbounded growth)
+                        if hasattr(self, 'max_grad_scale') and self.max_grad_scale is not None and new_scale > self.max_grad_scale:
+                            try:
                                 self.scaler._scale.fill_(self.max_grad_scale)
                                 if batch_idx % 500 == 0:
-                                    logger.info(f"Gradient scale capped at {self.max_grad_scale} (was {new_scale:.0f})")
-                        else:
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                            self.scaler.step(self.optimizer)
-                            self.scaler.update()
+                                    logger.info(f"Grad scale capped at {self.max_grad_scale} (was {float(new_scale):.0f})")
+                            except Exception:
+                                logger.warning("GradScaler._scale cap failed (internal API change)")
+
                     else:
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                        # FP32 fallback (no mixed precision)
+                        self.optimizer.zero_grad(set_to_none=True)
+                        total_loss.backward()
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                         self.optimizer.step()
 
                 # Cache loss values (single .item() call per loss - no duplicate GPU syncs)
@@ -463,7 +475,10 @@ class EnglishTrainer(KokoroTrainer):
                 }
 
                 if self.use_mixed_precision:
-                    postfix_dict['scale'] = f"{self.scaler.get_scale():.0f}"
+                    if self.use_grad_scaler and self.scaler:
+                        postfix_dict['scale'] = f"{self.scaler.get_scale():.0f}"
+                    else:
+                        postfix_dict['dtype'] = 'bf16'
 
                 if self.enable_adaptive_memory:
                     postfix_dict['mem'] = cleanup_result.get('pressure_level', 'unknown')[:3]

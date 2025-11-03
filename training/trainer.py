@@ -621,7 +621,7 @@ class KokoroTrainer:
         # --- Stop Token Loss ---
         stop_token_mask = mel_mask[:, :, 0]
         # Force FP32 for BCE loss to avoid numerical issues
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast("cuda", enabled=False):
             loss_stop_token_unreduced = self.criterion_stop_token(
                 predicted_stop_logits.float(), stop_token_targets.float()
             )
