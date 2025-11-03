@@ -53,6 +53,7 @@ class EnglishTrainer(KokoroTrainer):
             if torch.cuda.is_bf16_supported():
                 # ✅ Prefer BF16 on modern GPUs (Ampere/Ada/Hopper)
                 self.autocast_dtype = torch.bfloat16
+                self.mixed_precision_dtype = torch.bfloat16
                 self.scaler = None  # No GradScaler needed for BF16
                 self.use_grad_scaler = False
                 self.device_type = 'cuda'
@@ -61,6 +62,7 @@ class EnglishTrainer(KokoroTrainer):
             else:
                 # Fallback to FP16 with conservative GradScaler for older GPUs
                 self.autocast_dtype = torch.float16
+                self.mixed_precision_dtype = torch.float16
                 self.scaler = torch.cuda.amp.GradScaler(
                     init_scale=2**12,  # Conservative initial scale (4096)
                     growth_factor=2.0,
@@ -79,12 +81,14 @@ class EnglishTrainer(KokoroTrainer):
             config_dtype = getattr(config, 'mixed_precision_dtype', torch.float16)
             if config_dtype == torch.bfloat16:
                 self.autocast_dtype = torch.bfloat16
+                self.mixed_precision_dtype = torch.bfloat16
                 self.scaler = None
                 self.use_grad_scaler = False
                 logger.info("✓ Using bfloat16 autocast on MPS (no scaler needed)")
             else:
                 from .mps_grad_scaler import MPSGradScaler
                 self.autocast_dtype = torch.float16
+                self.mixed_precision_dtype = torch.float16
                 self.scaler = MPSGradScaler(
                     init_scale=2**12,
                     growth_factor=2.0,
@@ -101,6 +105,7 @@ class EnglishTrainer(KokoroTrainer):
             self.scaler = None
             self.use_grad_scaler = False
             self.autocast_dtype = torch.float32
+            self.mixed_precision_dtype = torch.float32
             self.device_type = self.device.type
             if self.device.type == DeviceType.CUDA.value or self.device.type == DeviceType.MPS.value:
                 logger.info("Mixed precision training disabled by configuration")
