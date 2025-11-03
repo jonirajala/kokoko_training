@@ -559,18 +559,7 @@ class EnglishTrainer(KokoroTrainer):
     def get_autocast_context(self):
         """Get the appropriate autocast context for the device"""
         import torch
-
         if not self.use_mixed_precision:
-            # Return a no-op context manager
             from contextlib import nullcontext
             return nullcontext()
-
-        if self.device_type == DeviceType.CUDA.value:
-            # Use new API: torch.amp.autocast instead of torch.cuda.amp.autocast
-            return torch.amp.autocast("cuda", dtype=torch.float16)
-        elif self.device_type == DeviceType.MPS.value:
-            # MPS autocast with proper torch.dtype
-            return torch.amp.autocast("mps", dtype=torch.float16)
-        else:
-            from contextlib import nullcontext
-            return nullcontext()
+        return torch.amp.autocast("cuda", dtype=self.autocast_dtype)
