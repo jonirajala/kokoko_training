@@ -1,51 +1,55 @@
 #!/usr/bin/env python3
 """
-English TTS Trainer - extends KokoroTrainer for English dataset
+English TTS Trainer - Standalone trainer for English dataset with BF16/FP16 mixed precision support
 """
 
-from .trainer import KokoroTrainer
+import os
+import time
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+import logging
+import torch.profiler
+import gc
+from typing import Tuple, Dict, Any, Optional
+
+import datetime
+from .device_type import DeviceType
 from data.ljspeech_dataset import LJSpeechDataset, collate_fn, LengthBasedBatchSampler
 from data.english_phoneme_processor import EnglishPhonemeProcessor
-from torch.utils.data import DataLoader
-from .device_type import DeviceType
-import logging
+from kokoro.model import KokoroModel
+from .checkpoint_manager import (
+    save_phoneme_processor, save_model_config, load_checkpoint, find_latest_checkpoint,
+    save_checkpoint, save_final_model, cleanup_old_checkpoints, check_disk_space
+)
+from .interbatch_profiler import InterbatchProfiler
+from .mps_grad_scaler import MPSGradScaler
+from .adaptive_memory_manager import AdaptiveMemoryManager
+import wandb
 
-# Optional W&B import
-try:
-    import wandb
-    WANDB_AVAILABLE = True
-except ImportError:
-    WANDB_AVAILABLE = False
-
+from contextlib import nullcontext
 logger = logging.getLogger(__name__)
 
 
-class EnglishTrainer(KokoroTrainer):
+class EnglishTrainer:
     """
-    Trainer for English TTS using LJSpeech dataset.
+    Standalone trainer for English TTS using LJSpeech dataset.
 
-    Extends KokoroTrainer but uses English dataset and phoneme processor.
+    Includes BF16/FP16 mixed precision support, W&B logging, and adaptive memory management.
     """
 
     def __init__(self, config):
         """Initialize English trainer with LJSpeech dataset"""
-
-        # We need to initialize the parent class partially, then override the dataset
-        # Call parent __init__ but we'll override dataset creation
-
-        # First, manually set up what parent __init__ does before creating dataset
         self.config = config
         self.device = config.device if hasattr(config, 'device') else 'cpu'
         if isinstance(self.device, str):
-            import torch
             self.device = torch.device(self.device)
 
         # Initialize memory manager and other components
-        from .adaptive_memory_manager import AdaptiveMemoryManager
         self.memory_manager = AdaptiveMemoryManager(self.device, config)
 
         # Mixed precision setup with automatic BF16/FP16 detection
-        import torch
         self.use_mixed_precision = getattr(config, 'use_mixed_precision', True)
 
         if self.use_mixed_precision and self.device.type == DeviceType.CUDA.value:
@@ -55,7 +59,6 @@ class EnglishTrainer(KokoroTrainer):
                 self.autocast_dtype = torch.bfloat16
                 self.mixed_precision_dtype = torch.bfloat16
                 self.scaler = None  # No GradScaler needed for BF16
-                self.use_grad_scaler = False
                 self.device_type = 'cuda'
                 logger.info("✓ Using bfloat16 autocast on CUDA (no GradScaler needed)")
                 logger.info("  GPU supports BF16 - optimal stability without scaling")
@@ -70,7 +73,6 @@ class EnglishTrainer(KokoroTrainer):
                     growth_interval=1000,
                     enabled=True
                 )
-                self.use_grad_scaler = True
                 self.max_grad_scale = 2**15  # Maximum scale limit (32768)
                 self.device_type = 'cuda'
                 logger.info("✓ Using float16 autocast on CUDA with GradScaler fallback")
@@ -83,10 +85,8 @@ class EnglishTrainer(KokoroTrainer):
                 self.autocast_dtype = torch.bfloat16
                 self.mixed_precision_dtype = torch.bfloat16
                 self.scaler = None
-                self.use_grad_scaler = False
                 logger.info("✓ Using bfloat16 autocast on MPS (no scaler needed)")
             else:
-                from .mps_grad_scaler import MPSGradScaler
                 self.autocast_dtype = torch.float16
                 self.mixed_precision_dtype = torch.float16
                 self.scaler = MPSGradScaler(
@@ -95,7 +95,6 @@ class EnglishTrainer(KokoroTrainer):
                     backoff_factor=0.5,
                     growth_interval=1000
                 )
-                self.use_grad_scaler = True
                 logger.info("✓ Using float16 autocast on MPS with custom scaler")
             self.device_type = DeviceType.MPS.value
 
@@ -103,7 +102,6 @@ class EnglishTrainer(KokoroTrainer):
             # CPU or mixed precision disabled
             self.use_mixed_precision = False
             self.scaler = None
-            self.use_grad_scaler = False
             self.autocast_dtype = torch.float32
             self.mixed_precision_dtype = torch.float32
             self.device_type = self.device.type
@@ -137,7 +135,6 @@ class EnglishTrainer(KokoroTrainer):
         )
 
         # Initialize model with English vocab size
-        from kokoro.model import KokoroModel
         vocab_size = self.dataset.phoneme_processor.get_vocab_size()
         logger.info(f"English vocabulary size: {vocab_size}")
 
@@ -172,7 +169,6 @@ class EnglishTrainer(KokoroTrainer):
         )
 
         # Loss functions
-        import torch.nn as nn
         self.criterion_mel = nn.L1Loss(reduction='none')
         self.criterion_duration = nn.MSELoss(reduction='none')
         self.criterion_stop_token = nn.BCEWithLogitsLoss(reduction='none')
@@ -213,14 +209,11 @@ class EnglishTrainer(KokoroTrainer):
         self.profiling_stats = {}
         self.memory_snapshots = []
 
-        import os
-        import datetime
         self.log_dir = os.path.join(config.output_dir, "profiler_logs",
                                     datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
         os.makedirs(self.log_dir, exist_ok=True)
 
         # Interbatch profiler
-        from .interbatch_profiler import InterbatchProfiler
         self.interbatch_profiler = InterbatchProfiler(config)
 
         # Memory management
@@ -228,16 +221,14 @@ class EnglishTrainer(KokoroTrainer):
         self.memory_report_interval = getattr(config, 'memory_report_interval', 500)
 
         # W&B initialization
-        self.use_wandb = getattr(config, 'use_wandb', False) and WANDB_AVAILABLE
+        self.use_wandb = getattr(config, 'use_wandb', False)
         self.wandb_run = None
 
-        logger.info(f"W&B requested: {getattr(config, 'use_wandb', False)}, W&B available: {WANDB_AVAILABLE}")
+        logger.info(f"W&B requested: {getattr(config, 'use_wandb', False)}")
 
         if self.use_wandb:
             logger.info("Initializing W&B logging...")
             self._init_wandb()
-        elif getattr(config, 'use_wandb', False) and not WANDB_AVAILABLE:
-            logger.warning("W&B logging requested but wandb not installed. Install with: pip install wandb")
         else:
             logger.info("W&B logging disabled")
 
@@ -245,9 +236,6 @@ class EnglishTrainer(KokoroTrainer):
 
     def _init_wandb(self):
         """Initialize Weights & Biases logging"""
-        if not WANDB_AVAILABLE:
-            return
-
         try:
             # Prepare wandb config
             wandb_config = {
@@ -315,10 +303,6 @@ class EnglishTrainer(KokoroTrainer):
 
     def train_epoch(self, epoch: int):
         """Override train_epoch to add per-batch W&B logging"""
-        from tqdm import tqdm
-        import torch
-        import torch.profiler
-
         self.model.train()
         total_loss_epoch = 0.0
         mel_loss_epoch = 0.0
@@ -402,7 +386,7 @@ class EnglishTrainer(KokoroTrainer):
 
                         self.optimizer.step()
 
-                    elif self.use_mixed_precision and self.use_grad_scaler:
+                    elif self.use_mixed_precision and self.scaler is not None:
                         # FP16 path with GradScaler (backward compatibility)
                         self.scaler.scale(total_loss).backward()
                         self.scaler.unscale_(self.optimizer)
@@ -460,7 +444,7 @@ class EnglishTrainer(KokoroTrainer):
                     }
 
                     # Only log grad_scale if using FP16 with GradScaler
-                    if self.use_mixed_precision and self.use_grad_scaler and self.scaler:
+                    if self.use_mixed_precision and self.scaler is not None:
                         wandb_metrics["train/grad_scale"] = self.scaler.get_scale()
 
                     # commit=False prevents blocking on network I/O
@@ -476,7 +460,7 @@ class EnglishTrainer(KokoroTrainer):
                 }
 
                 if self.use_mixed_precision:
-                    if self.use_grad_scaler and self.scaler:
+                    if self.scaler is not None:
                         postfix_dict['scale'] = f"{self.scaler.get_scale():.0f}"
                     else:
                         postfix_dict['dtype'] = 'bf16'
@@ -540,12 +524,107 @@ class EnglishTrainer(KokoroTrainer):
         return avg_total_loss, avg_mel_loss, avg_dur_loss, avg_stop_loss
 
     def train(self):
-        """Override train to properly finish W&B run"""
+        """Main training function with mixed precision support and W&B logging"""
         try:
-            # Call parent's train method
-            super().train()
+            os.makedirs(self.config.output_dir, exist_ok=True)
 
-            # Mark run as finished
+            self.setup_checkpoint_resumption()
+            save_phoneme_processor(self.dataset.phoneme_processor, self.config.output_dir)
+            save_model_config(self.config, self.config.output_dir)
+
+            logger.info(f"Starting training on device: {self.device} ({self.device_type})")
+            logger.info(f"Mixed precision training: {'Enabled' if self.use_mixed_precision else 'Disabled'}")
+            if self.use_mixed_precision:
+                logger.info(f"Mixed precision dtype: {self.mixed_precision_dtype}")
+                if self.device_type == DeviceType.MPS.value:
+                    logger.info("Using custom MPS gradient scaler (experimental)")
+            logger.info(f"Adaptive memory management: {'Enabled' if self.enable_adaptive_memory else 'Disabled'}")
+            logger.info(f"Total epochs: {self.config.num_epochs}, Starting from epoch: {self.start_epoch + 1}")
+            logger.info(f"Model vocabulary size: {self.dataset.phoneme_processor.get_vocab_size()}")
+            logger.info(f"Initial learning rate: {self.config.learning_rate}")
+            logger.info(f"Scheduler: CosineAnnealingWarmRestarts (T_0={self.config.lr_T_0}, T_mult={self.config.lr_T_mult}, eta_min={self.config.lr_eta_min})")
+            logger.info(f"Loss weights: Mel={1.0}, Duration={self.config.duration_loss_weight}, StopToken={self.config.stop_token_loss_weight}")
+
+            enable_profiling = getattr(self.config, 'enable_profiling', False)
+            if enable_profiling:
+                logger.info(f"Profiler logs will be saved to: {self.log_dir}")
+
+            # Log interbatch profiling settings
+            enable_interbatch_profiling = getattr(self.config, 'enable_interbatch_profiling', False)
+            if enable_interbatch_profiling and enable_profiling:
+                logger.info(f"Interbatch profiling enabled with report interval: {getattr(self.config, 'interbatch_report_interval', 100)}")
+
+            # Log adaptive memory settings
+            if self.enable_adaptive_memory:
+                logger.info(f"Adaptive memory management enabled:")
+                logger.info(f"  Memory report interval: {self.memory_report_interval} batches")
+                thresholds = self.memory_manager.thresholds
+                logger.info(f"  Memory thresholds: Low={thresholds.low_threshold*100:.0f}%, "
+                           f"Moderate={thresholds.moderate_threshold*100:.0f}%, "
+                           f"High={thresholds.high_threshold*100:.0f}%, "
+                           f"Critical={thresholds.critical_threshold*100:.0f}%")
+
+            # Run standalone profiling if requested
+            if hasattr(self.config, 'run_standalone_profiling') and self.config.run_standalone_profiling:
+                logger.info(f"Running standalone profiling before training on {self.device_type}...")
+                self.profile_training_steps(self.config.profile_steps)
+
+            for epoch in range(self.start_epoch, self.config.num_epochs):
+                avg_total_loss, avg_mel_loss, avg_dur_loss, avg_stop_loss = self.train_epoch(epoch)
+
+                # Note: scheduler.step() is now called per batch, not per epoch
+                current_lr = self.optimizer.param_groups[0]['lr']
+                logger.info(f"Epoch {epoch+1} completed. "
+                            f"Avg Total Loss: {avg_total_loss:.4f}, "
+                            f"Avg Mel Loss: {avg_mel_loss:.4f}, "
+                            f"Avg Dur Loss: {avg_dur_loss:.4f}, "
+                            f"Avg Stop Loss: {avg_stop_loss:.4f}, "
+                            f"Current LR: {current_lr:.8f}")
+
+                # Log memory management stats for this epoch
+                if self.enable_adaptive_memory:
+                    memory_report = self.memory_manager.get_memory_report()
+                    logger.info(f"Memory Management Summary - Epoch {epoch+1}:")
+                    logger.info(f"  Current Pressure: {memory_report['current_pressure']}")
+                    logger.info(f"  Cleanups This Epoch: {memory_report['cleanup_count']}")
+                    logger.info(f"  Memory Trend: {memory_report['memory_trend']:+.2f}%")
+                    logger.info(f"  Cleanup Overhead: {memory_report['cleanup_overhead_percent']:.2f}%")
+
+                if (epoch + 1) % self.config.save_every == 0:
+                    # save_checkpoint_with_scaler handles both FP16 (with scaler) and BF16/FP32 (without scaler)
+                    self.save_checkpoint_with_scaler(epoch, avg_total_loss)
+                    logger.info(f"Checkpoint saved for epoch {epoch+1}")
+
+                # Strategic memory cleanup at epoch end
+                if self.enable_adaptive_memory:
+                    self.memory_manager.adaptive_cleanup(epoch * len(self.dataloader), force=True)
+                else:
+                    self.clear_device_cache()
+
+            logger.info("Training finished. Saving final model.")
+            save_final_model(self.model, self.config, self.config.output_dir)
+
+            # Print final mixed precision statistics
+            if self.use_mixed_precision:
+                mp_stats = self.mixed_precision_stats
+                total_steps = mp_stats['successful_steps'] + mp_stats.get('skipped_steps', 0) + mp_stats['overflow_count']
+                if total_steps > 0:
+                    success_rate = (mp_stats['successful_steps'] / total_steps) * 100
+                    logger.info(f"Final Mixed Precision Statistics ({self.device_type.upper()}):")
+                    logger.info(f"  Total Steps: {total_steps}")
+                    logger.info(f"  Successful Steps: {mp_stats['successful_steps']}")
+                    logger.info(f"  Skipped Steps: {mp_stats.get('skipped_steps', 0)}")
+                    logger.info(f"  Overflow Count: {mp_stats['overflow_count']}")
+                    logger.info(f"  Success Rate: {success_rate:.1f}%")
+                    logger.info(f"  Scale Updates: {mp_stats['scale_updates']}")
+                    logger.info(f"  Scale Decreases: {mp_stats['scale_decreases']}")
+
+            # Print final memory management report
+            if self.enable_adaptive_memory:
+                logger.info("Final Memory Management Report:")
+                self.print_memory_management_report()
+
+            # Mark W&B run as finished (English-specific)
             if self.use_wandb and self.wandb_run:
                 wandb.finish()
                 logger.info("W&B run finished successfully")
@@ -558,8 +637,653 @@ class EnglishTrainer(KokoroTrainer):
 
     def get_autocast_context(self):
         """Get the appropriate autocast context for the device"""
-        import torch
         if not self.use_mixed_precision:
-            from contextlib import nullcontext
             return nullcontext()
         return torch.amp.autocast("cuda", dtype=self.autocast_dtype)
+
+    def adaptive_memory_cleanup(self, batch_idx: int, force: bool = False):
+        """Perform adaptive memory cleanup"""
+        if self.enable_adaptive_memory:
+            return self.memory_manager.adaptive_cleanup(batch_idx, force)
+        else:
+            # Fallback to original cleanup behavior
+            if batch_idx % 200 == 0 and batch_idx > 0:
+                self.clear_device_cache()
+            return {'cleaned': False, 'pressure_level': 'disabled'}
+
+    def handle_oom_with_adaptive_cleanup(self, batch_idx: int, error: Exception) -> bool:
+        """
+        Handle OOM error with adaptive cleanup
+        Returns True if training should continue, False if unrecoverable
+        """
+        logger.error(f"OOM error at batch {batch_idx} on {self.device_type}: {error}")
+
+        if self.enable_adaptive_memory:
+            # Emergency cleanup
+            cleanup_result = self.memory_manager.emergency_cleanup()
+
+            # Log results
+            if cleanup_result['success']:
+                logger.info(f"Emergency cleanup freed {cleanup_result['memory_freed_mb']:.1f}MB")
+                return True  # Try to continue
+            else:
+                logger.error("Emergency cleanup failed to free significant memory")
+                return False  # Unrecoverable
+        else:
+            # Fallback emergency cleanup
+            self.clear_device_cache()
+            gc.collect()
+            return True
+
+    def clear_device_cache(self):
+        """Clear device cache based on device type"""
+        if self.device.type == DeviceType.CUDA.value:
+            torch.cuda.empty_cache()
+        elif self.device.type == DeviceType.MPS.value:
+            torch.mps.empty_cache()
+
+    def _calculate_losses(self, predicted_mel, predicted_log_durations, predicted_stop_logits,
+                         mel_specs, phoneme_durations, stop_token_targets,
+                         mel_lengths, phoneme_lengths):
+        """Numerically stable loss calculation with masking."""
+        eps = 1e-8
+
+        # --- Mel Spectrogram Loss ---
+        max_mel_len_batch = mel_specs.size(1)
+        mel_mask = (torch.arange(max_mel_len_batch, device=self.device)
+                    .expand(len(mel_lengths), max_mel_len_batch)
+                    < mel_lengths.unsqueeze(1))
+        mel_mask = mel_mask.unsqueeze(-1).expand_as(predicted_mel).float()
+
+        loss_mel_unreduced = self.criterion_mel(predicted_mel, mel_specs)
+        loss_mel = (loss_mel_unreduced * mel_mask).sum() / (mel_mask.sum() + eps)
+
+        # --- Duration Loss ---
+        max_phoneme_len_batch = phoneme_durations.size(1)
+        phoneme_mask = (torch.arange(max_phoneme_len_batch, device=self.device)
+                        .expand(len(phoneme_lengths), max_phoneme_len_batch)
+                        < phoneme_lengths.unsqueeze(1)).float()
+
+        # Safe log of durations
+        target_log_durations = torch.log(phoneme_durations.float().clamp(min=1e-5))
+        loss_duration_unreduced = self.criterion_duration(
+            predicted_log_durations.float(), target_log_durations
+        )
+        loss_duration = (loss_duration_unreduced * phoneme_mask).sum() / (phoneme_mask.sum() + eps)
+
+        # --- Stop Token Loss ---
+        stop_token_mask = mel_mask[:, :, 0]
+        # Force FP32 for BCE loss to avoid numerical issues
+        with torch.amp.autocast("cuda", enabled=False):
+            loss_stop_token_unreduced = self.criterion_stop_token(
+                predicted_stop_logits.float(), stop_token_targets.float()
+            )
+        loss_stop_token = (loss_stop_token_unreduced * stop_token_mask).sum() / (stop_token_mask.sum() + eps)
+
+        # --- Combine ---
+        total_loss = (
+            loss_mel +
+            loss_duration * self.config.duration_loss_weight +
+            loss_stop_token * self.config.stop_token_loss_weight
+        )
+
+        return total_loss, loss_mel, loss_duration, loss_stop_token
+
+    def setup_checkpoint_resumption(self):
+        """Handle checkpoint resumption with mixed precision state"""
+
+        if not self.config.resume_checkpoint:
+            logger.info("No resume checkpoint specified, starting from scratch.")
+            return
+
+        checkpoint_path = None
+        if self.config.resume_checkpoint.lower() == 'auto':
+            checkpoint_path = find_latest_checkpoint(self.config.output_dir)
+            if not checkpoint_path:
+                logger.info("No checkpoint found for auto-resume, starting from scratch.")
+                return
+        else:
+            checkpoint_path = self.config.resume_checkpoint
+            if not os.path.exists(checkpoint_path):
+                logger.error(f"Checkpoint not found: {checkpoint_path}")
+                raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+        logger.info(f"Resuming from checkpoint: {checkpoint_path}")
+        self.start_epoch, self.best_loss, phoneme_processor = load_checkpoint(
+            checkpoint_path, self.model, self.optimizer, self.scheduler, self.config.output_dir
+        )
+
+        # Load scaler state if available (only for FP16)
+        if self.scaler is not None:
+            try:
+                checkpoint = torch.load(checkpoint_path, map_location=self.device)
+                if 'scaler' in checkpoint:
+                    self.scaler.load_state_dict(checkpoint['scaler'])
+                    logger.info(f"Loaded {self.device_type.upper()} scaler state from checkpoint")
+                else:
+                    logger.info(f"No scaler state found in checkpoint, using default for {self.device_type}")
+            except Exception as e:
+                logger.warning(f"Could not load scaler state: {e}")
+
+        self.dataset.phoneme_processor = phoneme_processor
+        logger.info(f"Resumed from epoch {self.start_epoch}, best loss {self.best_loss:.4f}")
+
+    def save_checkpoint_with_scaler(self, epoch: int, loss: float):
+        """Save checkpoint including scaler state with disk space check and cleanup"""
+
+        # Check disk space before saving
+        if not check_disk_space(self.config.output_dir, min_free_gb=5.0):
+            logger.warning(f"Skipping checkpoint save for epoch {epoch+1} due to insufficient disk space")
+            return
+
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'loss': loss,
+            'config': self.config,
+        }
+
+        # Only save scaler state if using FP16 (BF16 doesn't need scaler)
+        if self.scaler is not None:
+            checkpoint['scaler'] = self.scaler.state_dict()
+            checkpoint['device_type'] = self.device_type  # Store device type for proper restoration
+
+        checkpoint_path = os.path.join(self.config.output_dir, f'checkpoint_epoch_{epoch+1}.pth')
+
+        try:
+            torch.save(checkpoint, checkpoint_path)
+            logger.info(f"Checkpoint saved to {checkpoint_path}")
+
+            # Cleanup old checkpoints if configured
+            keep_last_n = getattr(self.config, 'keep_last_n_checkpoints', 3)
+            if keep_last_n > 0:
+                cleanup_old_checkpoints(self.config.output_dir, keep_last_n)
+        except Exception as e:
+            logger.error(f"Failed to save checkpoint: {e}")
+            logger.error("Training will continue without this checkpoint")
+
+    def print_memory_management_report(self):
+        """Print comprehensive memory management report"""
+        if self.enable_adaptive_memory:
+            report = self.memory_manager.get_memory_report()
+
+            print("\n" + "="*60)
+            print("ADAPTIVE MEMORY MANAGEMENT REPORT")
+            print("="*60)
+
+            print(f"\nDevice: {report['device_type'].upper()}")
+            print(f"Total Batches Processed: {report['total_batches']}")
+            print(f"Total Cleanups Performed: {report['cleanup_count']}")
+            print(f"Cleanup Frequency: {report['cleanup_frequency']:.4f} cleanups/batch")
+
+            print(f"\nPerformance Impact:")
+            print(f"  Total Cleanup Time: {report['total_cleanup_time_ms']:.1f}ms")
+            print(f"  Average Cleanup Time: {report['avg_cleanup_time_ms']:.1f}ms")
+            print(f"  Cleanup Overhead: {report['cleanup_overhead_percent']:.2f}%")
+
+            print(f"\nMemory Status:")
+            print(f"  Current Pressure Level: {report['current_pressure'].upper()}")
+            print(f"  Current Usage: {report.get('current_memory_usage_percent', 0):.1f}%")
+            print(f"  Average Usage: {report.get('avg_memory_usage_percent', 0):.1f}%")
+            print(f"  Peak Usage: {report.get('max_memory_usage_percent', 0):.1f}%")
+            print(f"  Memory Trend: {report['memory_trend']:+.2f}% (positive = increasing)")
+            print(f"  Consecutive High Pressure Batches: {report['consecutive_high_pressure']}")
+
+            print(f"\nRecommendations:")
+            recommendations = []
+
+            # Performance recommendations
+            if report['cleanup_overhead_percent'] > 5.0:
+                recommendations.append("• High cleanup overhead detected - consider optimizing cleanup frequency")
+
+            if report['cleanup_frequency'] > 0.1:
+                recommendations.append("• Very frequent cleanups - consider increasing batch size or reducing model size")
+
+            # Memory recommendations
+            if report.get('avg_memory_usage_percent', 0) > 85:
+                recommendations.append("• High average memory usage - consider reducing batch size")
+                if report['device_type'] == 'mps':
+                    recommendations.append("• For MPS: Unified memory architecture may benefit from smaller batches")
+
+            if report['memory_trend'] > 5.0:
+                recommendations.append("• Memory usage increasing - potential memory leak or insufficient cleanup")
+
+            if report['consecutive_high_pressure'] > 50:
+                recommendations.append("• Sustained high memory pressure - consider model architecture optimization")
+
+            # Device-specific recommendations
+            if report['device_type'] == 'mps':
+                recommendations.append("• MPS detected: Monitor for memory fragmentation in unified memory")
+                if report.get('avg_memory_usage_percent', 0) > 70:
+                    recommendations.append("• Consider using smaller batch sizes for MPS vs equivalent CUDA setup")
+            elif report['device_type'] == 'cuda':
+                if report['cleanup_frequency'] < 0.01:
+                    recommendations.append("• CUDA: Low cleanup frequency may indicate room for batch size increase")
+
+            if not recommendations:
+                recommendations.append("• Memory management appears optimal for current configuration")
+
+            for rec in recommendations:
+                print(rec)
+
+            print("="*60)
+        else:
+            logger.info("Adaptive memory management disabled")
+
+    def reset_profiling_stats(self):
+        """Reset profiling statistics"""
+        self.profiling_stats = {
+            'stage_stats': {},
+            'memory_snapshots': [],
+            'device_info': {
+                'device_name': self._get_device_name(),
+                'device_available': self._is_device_available(),
+                'device_type': self.device.type,
+                'mixed_precision_enabled': self.use_mixed_precision,
+                'mixed_precision_dtype': str(self.mixed_precision_dtype) if self.use_mixed_precision else None
+            }
+        }
+        self.memory_snapshots = []
+        self.interbatch_profiler.reset()
+
+    def _get_device_name(self):
+        """Get device name for different device types"""
+        if self.device.type == DeviceType.CUDA.value:
+            return torch.cuda.get_device_name()
+        elif self.device.type == DeviceType.MPS.value:
+            return 'Apple Silicon GPU'
+        else:
+            return 'CPU'
+
+    def _is_device_available(self):
+        """Check if device is available"""
+        if self.device.type == DeviceType.CUDA.value:
+            return torch.cuda.is_available()
+        elif self.device.type == DeviceType.MPS.value:
+            return torch.backends.mps.is_available()
+        else:
+            return True
+
+    def start_torch_profiler(self, output_dir: str = None):
+        """Start PyTorch profiler with comprehensive settings"""
+        if output_dir is None:
+            output_dir = self.log_dir
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        profiler_kwargs = {
+            'schedule': torch.profiler.schedule(
+                wait=self.config.profile_wait_steps,
+                warmup=self.config.profile_warmup_steps,
+                active=self.config.profile_steps,
+                repeat=1
+            ),
+            'on_trace_ready': torch.profiler.tensorboard_trace_handler(output_dir),
+            'with_stack': True,
+            'record_shapes': True,
+        }
+
+        # Add device-specific profiling options
+        if self.device.type == DeviceType.CUDA.value:
+            profiler_kwargs.update({
+                'profile_memory': True,
+                'with_flops': True
+            })
+        elif self.device.type == DeviceType.MPS.value:
+            # MPS profiling capabilities are more limited
+            profiler_kwargs.update({
+                'profile_memory': False,  # Not supported on MPS
+                'with_flops': False       # Not supported on MPS
+            })
+
+        self.profiler = torch.profiler.profile(**profiler_kwargs)
+        logger.info(f"Started PyTorch profiler for {self.device.type}, output dir: {output_dir}")
+        return self.profiler
+
+    def stop_torch_profiler(self):
+        """Stop PyTorch profiler"""
+        if self.profiler:
+            self.profiler.__exit__(None, None, None)
+            self.profiler = None
+            logger.info("PyTorch profiler stopped")
+
+    def profile_step(self):
+        """Step the profiler and log memory stats"""
+        if self.profiler:
+            self.profiler.step()
+
+        # Log memory statistics based on device type
+        current_memory = 0
+        peak_memory = 0
+        reserved_memory = 0
+        total_memory = 0
+
+        if self.device.type == DeviceType.CUDA.value:
+            current_memory = torch.cuda.memory_allocated() / 1024**2  # MB
+            peak_memory = torch.cuda.max_memory_allocated() / 1024**2  # MB
+            reserved_memory = torch.cuda.memory_reserved() / 1024**2  # MB
+            total_memory = torch.cuda.get_device_properties(self.device).total_memory / 1024**2  # MB
+        elif self.device.type == DeviceType.MPS.value:
+            # MPS doesn't have detailed memory stats, use approximations
+            try:
+                current_memory = torch.mps.current_allocated_memory() / 1024**2  # MB
+                peak_memory = current_memory  # MPS doesn't track peak separately
+                reserved_memory = current_memory
+                # Estimate total memory (this is approximate for Apple Silicon)
+                total_memory = 8192  # Default estimate, could be made configurable
+            except:
+                # Fallback if MPS memory functions aren't available
+                current_memory = peak_memory = reserved_memory = total_memory = 0
+
+        self.memory_snapshots.append({
+            'timestamp': time.time(),
+            'current_memory_mb': current_memory,
+            'peak_memory_mb': peak_memory,
+            'reserved_memory_mb': reserved_memory,
+            'total_memory_mb': total_memory,
+            'scaler_scale': self.scaler.get_scale() if self.scaler else None
+        })
+
+    def log_memory_stats(self, stage_name: str):
+        """Log memory statistics for a specific stage"""
+        current_memory = 0
+        peak_memory = 0
+
+        if self.device.type == DeviceType.CUDA.value:
+            current_memory = torch.cuda.memory_allocated() / 1024**2
+            peak_memory = torch.cuda.max_memory_allocated() / 1024**2
+        elif self.device.type == DeviceType.MPS.value:
+            try:
+                current_memory = torch.mps.current_allocated_memory() / 1024**2
+                peak_memory = current_memory
+            except:
+                current_memory = peak_memory = 0
+
+        if stage_name not in self.profiling_stats.get('stage_stats', {}):
+            self.profiling_stats.setdefault('stage_stats', {})[stage_name] = {
+                'memory_used_mb': current_memory,
+                'peak_memory_mb': peak_memory,
+                'call_count': 1,
+                'total_time_ms': 0
+            }
+        else:
+            stats = self.profiling_stats['stage_stats'][stage_name]
+            stats['memory_used_mb'] = max(stats['memory_used_mb'], current_memory)
+            stats['peak_memory_mb'] = max(stats['peak_memory_mb'], peak_memory)
+            stats['call_count'] += 1
+
+    def get_profiling_report(self) -> Dict[str, Any]:
+        """Generate comprehensive profiling report including mixed precision stats"""
+        report = {
+            'device_info': self.profiling_stats.get('device_info', {}),
+            'stage_stats': self.profiling_stats.get('stage_stats', {}),
+            'memory_snapshots': self.memory_snapshots,
+            'interbatch_stats': self.interbatch_profiler.get_statistics(),
+            'mixed_precision_stats': self.mixed_precision_stats.copy() if self.use_mixed_precision else None
+        }
+
+        # Memory summary
+        if self.memory_snapshots:
+            latest_snapshot = self.memory_snapshots[-1]
+            report['memory_summary'] = {
+                'current_memory_mb': latest_snapshot['current_memory_mb'],
+                'peak_memory_mb': latest_snapshot['peak_memory_mb'],
+                'reserved_memory_mb': latest_snapshot['reserved_memory_mb'],
+                'total_memory_mb': latest_snapshot['total_memory_mb'],
+                'stage_stats': self.profiling_stats.get('stage_stats', {}),
+                'current_scaler_scale': latest_snapshot.get('scaler_scale')
+            }
+
+        # Memory analysis
+        stage_stats = self.profiling_stats.get('stage_stats', {})
+        if stage_stats:
+            most_memory_intensive = max(stage_stats.keys(),
+                                      key=lambda x: stage_stats[x]['memory_used_mb'])
+            total_memory_used = sum(stats['memory_used_mb'] for stats in stage_stats.values())
+
+            report['memory_analysis'] = {
+                'most_memory_intensive_stage': most_memory_intensive,
+                'total_memory_used_mb': total_memory_used
+            }
+
+        # Model info
+        if hasattr(self.model, 'get_model_info'):
+            report['model_info'] = self.model.get_model_info()
+
+        return report
+
+    def analyze_profiling_results(self, profiling_report: Dict[str, Any]):
+        """Analyze and print profiling results in a readable format"""
+        print("\n" + "="*60)
+        print("GPU/MPS PROFILING ANALYSIS REPORT")
+        print("="*60)
+
+        # Device information
+        device_info = profiling_report.get('device_info', {})
+        print(f"\nDevice: {device_info.get('device_name', 'Unknown')}")
+        print(f"Device Type: {device_info.get('device_type', 'Unknown')}")
+        print(f"Device Available: {device_info.get('device_available', False)}")
+        print(f"Mixed Precision: {device_info.get('mixed_precision_enabled', False)}")
+        if device_info.get('mixed_precision_dtype'):
+            print(f"Mixed Precision Dtype: {device_info.get('mixed_precision_dtype')}")
+
+        # Mixed precision statistics
+        mp_stats = profiling_report.get('mixed_precision_stats')
+        if mp_stats:
+            print(f"\nMixed Precision Statistics:")
+            print(f"  Successful Steps: {mp_stats.get('successful_steps', 0)}")
+            print(f"  Skipped Steps: {mp_stats.get('skipped_steps', 0)}")
+            print(f"  Scale Updates: {mp_stats.get('scale_updates', 0)}")
+            print(f"  Scale Decreases: {mp_stats.get('scale_decreases', 0)}")
+            print(f"  Overflow Count: {mp_stats.get('overflow_count', 0)}")
+
+            total_steps = mp_stats.get('successful_steps', 0) + mp_stats.get('skipped_steps', 0)
+            if total_steps > 0:
+                success_rate = (mp_stats.get('successful_steps', 0) / total_steps) * 100
+                print(f"  Success Rate: {success_rate:.1f}%")
+
+        # Memory analysis
+        memory_summary = profiling_report.get('memory_summary', {})
+        if memory_summary:
+            print(f"\nMemory Usage:")
+            print(f"  Current: {memory_summary.get('current_memory_mb', 0):.1f} MB")
+            print(f"  Peak: {memory_summary.get('peak_memory_mb', 0):.1f} MB")
+            print(f"  Reserved: {memory_summary.get('reserved_memory_mb', 0):.1f} MB")
+
+            device_type = device_info.get('device_type', 'unknown')
+            if device_type == DeviceType.CUDA.value:
+                print(f"  Total GPU: {memory_summary.get('total_memory_mb', 0):.1f} MB")
+            elif device_type == DeviceType.MPS.value:
+                print(f"  Estimated Total: {memory_summary.get('total_memory_mb', 0):.1f} MB")
+
+            # Memory efficiency
+            total_memory = memory_summary.get('total_memory_mb', 1)
+            peak_memory = memory_summary.get('peak_memory_mb', 0)
+            if total_memory > 0:
+                memory_efficiency = (peak_memory / total_memory) * 100
+                print(f"  Memory Efficiency: {memory_efficiency:.1f}%")
+
+            if memory_summary.get('current_scaler_scale'):
+                print(f"  Current Scaler Scale: {memory_summary.get('current_scaler_scale'):.0f}")
+
+        # Print interbatch profiling report
+        self.interbatch_profiler.print_report()
+
+    def profile_training_steps(self, num_steps: int = 10):
+        """Profile a specific number of training steps with mixed precision support and adaptive memory management"""
+        logger.info(f"Starting profiling for {num_steps} training steps on {self.device.type}")
+
+        self.reset_profiling_stats()
+        self.start_torch_profiler()
+
+        self.model.train()
+        total_time = 0
+        step_count = 0
+
+        for batch_idx, batch in enumerate(self.dataloader):
+            if step_count >= num_steps:
+                break
+
+            start_time = time.time()
+
+            try:
+                # Start interbatch profiling
+                self.interbatch_profiler.start_batch()
+
+                # Adaptive memory cleanup check during profiling
+                cleanup_result = self.adaptive_memory_cleanup(batch_idx)
+
+                # Profile step
+                self.profile_step()
+
+                # Data loading profiling
+                self.interbatch_profiler.start_data_loading()
+                with torch.profiler.record_function("Data_Loading"):
+                    mel_specs = batch['mel_specs'].to(self.device, non_blocking=self.device.type=='cuda')
+                    phoneme_indices = batch['phoneme_indices'].to(self.device, non_blocking=self.device.type=='cuda')
+                    phoneme_durations = batch['phoneme_durations'].to(self.device, non_blocking=self.device.type=='cuda')
+                    stop_token_targets = batch['stop_token_targets'].to(self.device, non_blocking=self.device.type=='cuda')
+                    mel_lengths = batch['mel_lengths'].to(self.device, non_blocking=self.device.type=='cuda')
+                    phoneme_lengths = batch['phoneme_lengths'].to(self.device, non_blocking=self.device.type=='cuda')
+                self.interbatch_profiler.end_data_loading()
+
+                self.log_memory_stats("data_loading")
+
+                with torch.profiler.record_function("Zero_Grad"):
+                    self.optimizer.zero_grad()
+
+                # Forward pass with mixed precision
+                self.interbatch_profiler.start_forward_pass()
+                with torch.profiler.record_function("Model_Forward"):
+                    if self.use_mixed_precision:
+                        with self.get_autocast_context():
+                            predicted_mel, predicted_log_durations, predicted_stop_logits = \
+                                self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets)
+                    else:
+                        predicted_mel, predicted_log_durations, predicted_stop_logits = \
+                            self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets)
+                self.interbatch_profiler.end_forward_pass()
+
+                self.log_memory_stats("forward_pass")
+
+                # Loss calculation with mixed precision
+                with torch.profiler.record_function("Loss_Calculation"):
+                    if self.use_mixed_precision:
+                        with self.get_autocast_context():
+                            total_loss, loss_mel, loss_duration, loss_stop_token = self._calculate_losses(
+                                predicted_mel, predicted_log_durations, predicted_stop_logits,
+                                mel_specs, phoneme_durations, stop_token_targets,
+                                mel_lengths, phoneme_lengths
+                            )
+                    else:
+                        total_loss, loss_mel, loss_duration, loss_stop_token = self._calculate_losses(
+                            predicted_mel, predicted_log_durations, predicted_stop_logits,
+                            mel_specs, phoneme_durations, stop_token_targets,
+                            mel_lengths, phoneme_lengths
+                        )
+
+                self.log_memory_stats("loss_calculation")
+
+                # Backward pass with profiling
+                self.interbatch_profiler.start_backward_pass()
+
+                # ========== Backward + Optimizer Step (Simplified) ==========
+                with torch.profiler.record_function("Backward_Pass"):
+                    if self.use_mixed_precision and self.autocast_dtype == torch.bfloat16:
+                        # ✅ BF16 path (no GradScaler needed - inherently stable)
+                        self.optimizer.zero_grad(set_to_none=True)
+                        total_loss.backward()
+                        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+
+                        if not torch.isfinite(grad_norm):
+                            logger.warning(f"[Profiling Step {step_count}] Non-finite grad norm ({grad_norm:.2f}). Skipping batch.")
+                            self.optimizer.zero_grad(set_to_none=True)
+                            continue
+
+                        self.optimizer.step()
+                        self.mixed_precision_stats['successful_steps'] += 1
+
+                    elif self.use_mixed_precision and self.scaler is not None:
+                        # FP16 path with GradScaler (backward compatibility)
+                        self.scaler.scale(total_loss).backward()
+                        self.scaler.unscale_(self.optimizer)
+                        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+
+                        if not torch.isfinite(grad_norm):
+                            logger.warning(f"[Profiling Step {step_count}] Non-finite grad norm ({grad_norm:.2f}). Skipping batch.")
+                            self.optimizer.zero_grad(set_to_none=True)
+                            self.scaler.update()
+                            continue
+
+                        self.scaler.step(self.optimizer)
+                        old_scale = self.scaler.get_scale()
+                        self.scaler.update()
+                        new_scale = self.scaler.get_scale()
+
+                        # Cap grad scale if needed
+                        if hasattr(self, 'max_grad_scale') and self.max_grad_scale is not None and new_scale > self.max_grad_scale:
+                            try:
+                                self.scaler._scale.fill_(self.max_grad_scale)
+                            except Exception:
+                                pass  # Ignore during profiling
+
+                        # Update mixed precision stats
+                        if new_scale != old_scale:
+                            self.mixed_precision_stats['scale_updates'] += 1
+                            if new_scale < old_scale:
+                                self.mixed_precision_stats['scale_decreases'] += 1
+                                self.mixed_precision_stats['overflow_count'] += 1
+                            else:
+                                self.mixed_precision_stats['successful_steps'] += 1
+                        else:
+                            self.mixed_precision_stats['successful_steps'] += 1
+
+                    else:
+                        # FP32 fallback (no mixed precision)
+                        self.optimizer.zero_grad(set_to_none=True)
+                        total_loss.backward()
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                        self.optimizer.step()
+                        self.mixed_precision_stats['successful_steps'] += 1
+
+                self.interbatch_profiler.end_backward_pass()
+                self.log_memory_stats("backward_pass")
+
+                # End batch profiling
+                batch_size = mel_specs.size(0)
+                self.interbatch_profiler.end_batch(batch_size)
+
+                step_time = time.time() - start_time
+                total_time += step_time
+                step_count += 1
+
+                if step_count % 2 == 0:
+                    memory_info = f", Mem: {cleanup_result.get('pressure_level', 'unknown')}" if self.enable_adaptive_memory else ""
+                    logger.info(f"Profiling Step {step_count}, Time: {step_time:.3f}s{memory_info}")
+
+            except Exception as e:
+                logger.error(f"Error in profiling step {step_count}: {e}")
+                if self.enable_adaptive_memory:
+                    self.memory_manager.emergency_cleanup()
+                else:
+                    self.clear_device_cache()
+                continue
+
+        self.stop_torch_profiler()
+
+        # Generate and analyze report
+        report = self.get_profiling_report()
+        logger.info(f"Training profiling completed. Total time: {total_time:.2f}s, "
+                   f"Avg time per step: {total_time/step_count:.3f}s")
+
+        # Print analysis
+        self.analyze_profiling_results(report)
+
+        # Print memory management report if enabled
+        if self.enable_adaptive_memory:
+            logger.info("Memory Management Report during profiling:")
+            self.print_memory_management_report()
+
+        return report
