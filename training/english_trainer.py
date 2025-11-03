@@ -44,44 +44,68 @@ class EnglishTrainer(KokoroTrainer):
         from .adaptive_memory_manager import AdaptiveMemoryManager
         self.memory_manager = AdaptiveMemoryManager(self.device, config)
 
-        # Mixed precision setup
+        # Mixed precision setup with automatic BF16/FP16 detection
         import torch
         self.use_mixed_precision = getattr(config, 'use_mixed_precision', True)
-        self.mixed_precision_dtype = getattr(config, 'mixed_precision_dtype', torch.float16)
 
-        import torch
-        if self.use_mixed_precision:
-            if self.device.type == DeviceType.CUDA.value:
-                # Initialize GradScaler with controlled growth and max scale cap
-                # growth_interval=2000 means scale only increases every 2000 successful steps
-                # init_scale=2**16 is a good starting point (65536)
-                # growth_factor=2.0 doubles scale when increasing
-                # backoff_factor=0.5 halves scale on overflow
+        if self.use_mixed_precision and self.device.type == DeviceType.CUDA.value:
+            # Auto-detect best dtype for CUDA devices
+            if torch.cuda.is_bf16_supported():
+                # ✅ Prefer BF16 on modern GPUs (Ampere/Ada/Hopper)
+                self.autocast_dtype = torch.bfloat16
+                self.scaler = None  # No GradScaler needed for BF16
+                self.use_grad_scaler = False
+                self.device_type = 'cuda'
+                logger.info("✓ Using bfloat16 autocast on CUDA (no GradScaler needed)")
+                logger.info("  GPU supports BF16 - optimal stability without scaling")
+            else:
+                # Fallback to FP16 with conservative GradScaler for older GPUs
+                self.autocast_dtype = torch.float16
                 self.scaler = torch.cuda.amp.GradScaler(
-                    init_scale=2**12,          # Start at 4096
-                    growth_factor=2.0,         # Double on success
-                    backoff_factor=0.5,        # Halve on overflow
-                    growth_interval=2000,      # Update every 2000 steps
+                    init_scale=2**12,  # Conservative initial scale (4096)
+                    growth_factor=2.0,
+                    backoff_factor=0.5,
+                    growth_interval=1000,
                     enabled=True
                 )
-                self.max_grad_scale = 2**15    # Cap at 32768 to prevent explosion
+                self.use_grad_scaler = True
+                self.max_grad_scale = 2**15  # Maximum scale limit (32768)
                 self.device_type = 'cuda'
-                logger.info(f"Mixed precision training enabled with CUDA GradScaler (max_scale={self.max_grad_scale})")
-            elif self.device.type == DeviceType.MPS.value:
-                from .mps_grad_scaler import MPSGradScaler
-                self.scaler = MPSGradScaler()
-                self.max_grad_scale = None  # MPS scaler handles this differently
-                self.device_type = DeviceType.MPS.value
-                logger.info("Mixed precision training enabled with MPS custom scaler")
-            else:
-                self.use_mixed_precision = False
+                logger.info("✓ Using float16 autocast on CUDA with GradScaler fallback")
+                logger.info("  GPU does not support BF16 - using FP16 with conservative scaling")
+
+        elif self.use_mixed_precision and self.device.type == DeviceType.MPS.value:
+            # MPS (Apple Silicon) handling
+            config_dtype = getattr(config, 'mixed_precision_dtype', torch.float16)
+            if config_dtype == torch.bfloat16:
+                self.autocast_dtype = torch.bfloat16
                 self.scaler = None
-                self.max_grad_scale = None
-                self.device_type = self.device.type
+                self.use_grad_scaler = False
+                logger.info("✓ Using bfloat16 autocast on MPS (no scaler needed)")
+            else:
+                from .mps_grad_scaler import MPSGradScaler
+                self.autocast_dtype = torch.float16
+                self.scaler = MPSGradScaler(
+                    init_scale=2**12,
+                    growth_factor=2.0,
+                    backoff_factor=0.5,
+                    growth_interval=1000
+                )
+                self.use_grad_scaler = True
+                logger.info("✓ Using float16 autocast on MPS with custom scaler")
+            self.device_type = DeviceType.MPS.value
+
         else:
+            # CPU or mixed precision disabled
+            self.use_mixed_precision = False
             self.scaler = None
-            self.max_grad_scale = None
+            self.use_grad_scaler = False
+            self.autocast_dtype = torch.float32
             self.device_type = self.device.type
+            if self.device.type == DeviceType.CUDA.value or self.device.type == DeviceType.MPS.value:
+                logger.info("Mixed precision training disabled by configuration")
+            else:
+                logger.info(f"Mixed precision not supported on {self.device.type}, using FP32")
 
         # NOW create our English dataset
         logger.info("Loading English LJSpeech dataset...")
