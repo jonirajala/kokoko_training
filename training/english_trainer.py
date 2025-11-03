@@ -309,7 +309,6 @@ class EnglishTrainer:
         # Calculate base global step for this epoch
         base_global_step = epoch * num_batches
 
-        # Use parent's profiling logic if needed
         is_profiling_epoch = (epoch == self.config.profile_epoch_start) and self.config.enable_profiling
         enable_interbatch_profiling = getattr(self.config, 'enable_interbatch_profiling', False)
 
@@ -366,7 +365,7 @@ class EnglishTrainer:
                         )
 
                 # Backward pass
-                # ========== Backward + Optimizer Step (Simplified) ==========
+                # ========== Backward + Optimizer Step  ==========
                 with torch.profiler.record_function("Backward_Pass"):
                     if self.use_mixed_precision and self.autocast_dtype == torch.bfloat16:
                         # ✅ BF16 path (no GradScaler needed - inherently stable)

@@ -8,8 +8,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-class MultiHeadAttentionImproved(nn.Module):
-    """Improved multi-head attention with better initialization and optional relative positioning"""
+class MultiHeadAttention(nn.Module):
+    """Multi-head attention with better initialization and optional relative positioning"""
 
     def __init__(self, d_model: int, num_heads: int, dropout: float = 0.1,
                  use_relative_pos: bool = False, max_relative_distance: int = 32):
@@ -157,8 +157,8 @@ class MultiHeadAttentionImproved(nn.Module):
         return output, attn_weights.mean(dim=1) # Return mean attention weights for visualization/debugging
 
 
-class ImprovedTransformerEncoderBlock(nn.Module):
-    """Enhanced Transformer encoder block with better normalization and activations"""
+class TransformerEncoderBlock(nn.Module):
+    """Transformer encoder block with better normalization and activations"""
 
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float,
                  activation: str = 'gelu', use_prenorm: bool = True,
@@ -167,7 +167,7 @@ class ImprovedTransformerEncoderBlock(nn.Module):
         self.use_prenorm = use_prenorm
 
         # Self-attention module
-        self.self_attn = MultiHeadAttentionImproved(
+        self.self_attn = MultiHeadAttention(
             d_model, nhead, dropout, use_relative_pos
         )
 
@@ -254,8 +254,8 @@ class ImprovedTransformerEncoderBlock(nn.Module):
         return src
 
 
-class ImprovedTransformerDecoderBlock(nn.Module):
-    """Enhanced Transformer decoder block with improved architecture"""
+class TransformerDecoderBlock(nn.Module):
+    """Transformer decoder block with improved architecture"""
 
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float,
                  activation: str = 'gelu', use_prenorm: bool = True):
@@ -263,10 +263,10 @@ class ImprovedTransformerDecoderBlock(nn.Module):
         self.use_prenorm = use_prenorm
 
         # Decoder self-attention: usually causal, can use relative positional encoding
-        self.self_attn = MultiHeadAttentionImproved(d_model, nhead, dropout, use_relative_pos=True)
+        self.self_attn = MultiHeadAttention(d_model, nhead, dropout, use_relative_pos=True)
 
         # Cross-attention (encoder-decoder attention): no relative pos, queries from decoder, keys/values from encoder
-        self.cross_attn = MultiHeadAttentionImproved(d_model, nhead, dropout, use_relative_pos=False)
+        self.cross_attn = MultiHeadAttention(d_model, nhead, dropout, use_relative_pos=False)
 
         # Activation function for feed-forward network
         if activation == 'gelu':
@@ -365,8 +365,8 @@ class ImprovedTransformerDecoderBlock(nn.Module):
         return tgt
 
 
-class ImprovedTransformerDecoder(nn.Module):
-    """Enhanced Transformer decoder with better layer organization"""
+class TransformerDecoder(nn.Module):
+    """Transformer decoder with better layer organization"""
 
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int,
                  dropout: float, num_layers: int, use_prenorm: bool = True,
@@ -376,7 +376,7 @@ class ImprovedTransformerDecoder(nn.Module):
         self.use_prenorm = use_prenorm
 
         self.layers = nn.ModuleList([
-            ImprovedTransformerDecoderBlock(
+            TransformerDecoderBlock(
                 d_model, nhead, dim_feedforward, dropout, activation, use_prenorm
             ) for _ in range(num_layers)
         ])
@@ -419,56 +419,3 @@ class ImprovedTransformerDecoder(nn.Module):
             output = self.norm(output)
 
         return output
-
-
-# --- Compatibility Layer for Original Model (if needed) ---
-# If your main model (KokoroModel) expects 'TransformerEncoderBlock' and 'TransformerDecoder'
-# as directly defined classes (not the 'Improved' ones), these wrappers ensure compatibility.
-
-class TransformerEncoderBlock(ImprovedTransformerEncoderBlock):
-    """
-    Backward compatibility wrapper for the original TransformerEncoderBlock.
-    Defaults to original Transformer's post-norm, ReLU, no relative pos.
-    """
-    def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float):
-        super().__init__(d_model, nhead, dim_feedforward, dropout,
-                        activation='relu', use_prenorm=False, use_relative_pos=False)
-
-
-class TransformerDecoder(ImprovedTransformerDecoder):
-    """
-    Backward compatibility wrapper for the original TransformerDecoder.
-    Defaults to original Transformer's post-norm, ReLU.
-    """
-    def __init__(self, d_model: int, nhead: int, dim_feedforward: int,
-                 dropout: float, num_layers: int):
-        super().__init__(d_model, nhead, dim_feedforward, dropout, num_layers,
-                        use_prenorm=False, activation='relu')
-
-
-# --- Helper functions for optimized components (optional, for direct use) ---
-# These can be used if you want to explicitly create the improved versions.
-
-def create_optimized_encoder_layers(d_model: int, nhead: int, dim_feedforward: int,
-                                   dropout: float, num_layers: int,
-                                   use_prenorm: bool = True,
-                                   activation: str = 'gelu',
-                                   use_relative_pos: bool = False) -> nn.ModuleList:
-    """Create a list of optimized encoder layers."""
-    return nn.ModuleList([
-        ImprovedTransformerEncoderBlock(
-            d_model, nhead, dim_feedforward, dropout,
-            activation, use_prenorm, use_relative_pos
-        ) for _ in range(num_layers)
-    ])
-
-
-def create_optimized_decoder(d_model: int, nhead: int, dim_feedforward: int,
-                           dropout: float, num_layers: int,
-                           use_prenorm: bool = True,
-                           activation: str = 'gelu') -> ImprovedTransformerDecoder:
-    """Create an optimized transformer decoder."""
-    return ImprovedTransformerDecoder(
-        d_model, nhead, dim_feedforward, dropout, num_layers,
-        use_prenorm, activation
-    )
