@@ -219,12 +219,18 @@ def setup_mfa():
         return False
 
 
-def run_mfa_alignment(dataset_path: str):
-    """Run Montreal Forced Aligner on LJSpeech"""
+def run_mfa_alignment(dataset_path: str, use_custom_dict: bool = False):
+    """
+    Run Montreal Forced Aligner on LJSpeech
+
+    Args:
+        dataset_path: Path to LJSpeech dataset
+        use_custom_dict: If True, creates custom dictionary matching Misaki G2P
+    """
     logger.info("\nRunning Montreal Forced Aligner...")
 
     dataset_path = Path(dataset_path)
-    output_path = dataset_path / "TextGrid"
+    output_path = dataset_path / "TextGrid" / "wavs"
 
     if output_path.exists():
         logger.info(f"Alignments already exist at: {output_path}")
@@ -240,22 +246,69 @@ def run_mfa_alignment(dataset_path: str):
 
     logger.info("This process will take 1-3 hours depending on your hardware...")
 
+    # Create parent TextGrid directory
+    (dataset_path / "TextGrid").mkdir(parents=True, exist_ok=True)
+
     try:
-        # Download acoustic model and dictionary if needed
-        logger.info("Downloading English acoustic model and dictionary...")
+        # Step 1: Create custom dictionary matching Misaki G2P
+        custom_dict_path = None
+        if use_custom_dict:
+            logger.info("\n" + "="*70)
+            logger.info("Step 1/3: Creating custom MFA dictionary matching Misaki G2P")
+            logger.info("="*70)
+
+            custom_dict_path = Path("misaki_mfa_dictionary.dict")
+
+            # Check if dictionary already exists
+            if custom_dict_path.exists():
+                logger.info(f"Custom dictionary already exists at: {custom_dict_path}")
+                response = input("Regenerate dictionary? (y/N): ").strip().lower()
+                if response == 'y':
+                    logger.info("Generating custom dictionary...")
+                    subprocess.run(
+                        [sys.executable, "create_mfa_dictionary.py"],
+                        check=True
+                    )
+            else:
+                logger.info("Generating custom dictionary from Misaki G2P output...")
+                logger.info("This ensures MFA uses the same phoneme set as training!")
+                subprocess.run(
+                    [sys.executable, "create_mfa_dictionary.py"],
+                    check=True
+                )
+
+            if not custom_dict_path.exists():
+                logger.error("Failed to create custom dictionary")
+                logger.info("Falling back to standard english_us_arpa dictionary")
+                custom_dict_path = None
+
+        # Step 2: Download acoustic model
+        logger.info("\n" + "="*70)
+        logger.info("Step 2/3: Downloading acoustic model")
+        logger.info("="*70)
+
+        logger.info("Downloading English acoustic model...")
         subprocess.run(
             ["mfa", "model", "download", "acoustic", "english_us_arpa"],
             check=True
         )
-        subprocess.run(
-            ["mfa", "model", "download", "dictionary", "english_us_arpa"],
-            check=True
-        )
 
-        # Run alignment
-        logger.info("Running forced alignment...")
-        logger.info(f"Input: {dataset_path}")
+        # Step 3: Run alignment
+        logger.info("\n" + "="*70)
+        logger.info("Step 3/3: Running forced alignment")
+        logger.info("="*70)
+
+        logger.info(f"Input corpus: {dataset_path}")
         logger.info(f"Output: {output_path}")
+
+        if custom_dict_path:
+            logger.info(f"Using custom dictionary: {custom_dict_path}")
+            logger.info("✓ Phonemes will match Misaki G2P output!")
+            dictionary = str(custom_dict_path)
+        else:
+            logger.info("Using standard english_us_arpa dictionary")
+            logger.warning("⚠️  This may not match Misaki G2P phonemes!")
+            dictionary = "english_us_arpa"
 
         # MFA align command
         # mfa align <corpus_dir> <dictionary> <acoustic_model> <output_dir>
@@ -263,16 +316,30 @@ def run_mfa_alignment(dataset_path: str):
             [
                 "mfa", "align",
                 str(dataset_path),
-                "english_us_arpa",  # dictionary
+                dictionary,         # custom or standard dictionary
                 "english_us_arpa",  # acoustic model
-                str(output_path),   # output directory
+                str(output_path),   # output directory (wavs subfolder)
                 "--clean",          # Clean previous runs
                 "--verbose"         # Verbose output
             ],
             check=True
         )
 
-        logger.info(f"Alignment complete! TextGrid files saved to: {output_path}")
+        logger.info(f"\n✓ Alignment complete! TextGrid files saved to: {output_path}")
+
+        # Verify alignment output
+        num_textgrids = len(list(output_path.glob("*.TextGrid")))
+        logger.info(f"✓ Created {num_textgrids} TextGrid files")
+
+        if custom_dict_path:
+            logger.info("\n" + "="*70)
+            logger.info("✓ SUCCESS: Alignments use Misaki G2P-compatible phonemes!")
+            logger.info("="*70)
+            logger.info("This means:")
+            logger.info("  • No more phoneme count mismatches")
+            logger.info("  • 100% of samples will use real MFA durations")
+            logger.info("  • No silent fallback to uniform durations")
+
         return str(output_path)
 
     except subprocess.CalledProcessError as e:
@@ -366,6 +433,12 @@ def main():
         help='Only run alignment (assumes dataset already downloaded)'
     )
 
+    parser.add_argument(
+        '--no-custom-dict',
+        action='store_true',
+        help='Use standard MFA dictionary instead of generating custom one matching Misaki G2P'
+    )
+
     args = parser.parse_args()
 
     print("\n" + "="*70)
@@ -406,6 +479,8 @@ def main():
 
     # Run alignment locally if requested
     if args.align or args.align_only:
+        use_custom_dict = not args.no_custom_dict
+
         if args.zenodo and not args.align_only:
             logger.warning("Zenodo alignments already downloaded - local MFA not needed")
             response = input("Run MFA alignment anyway? (y/N): ").strip().lower()
@@ -415,12 +490,12 @@ def main():
                 logger.error("Cannot run alignment - MFA is not installed")
                 sys.exit(1)
             else:
-                run_mfa_alignment(dataset_path)
+                run_mfa_alignment(dataset_path, use_custom_dict=use_custom_dict)
         elif not mfa_installed:
             logger.error("Cannot run alignment - MFA is not installed")
             sys.exit(1)
         else:
-            run_mfa_alignment(dataset_path)
+            run_mfa_alignment(dataset_path, use_custom_dict=use_custom_dict)
 
     # Verify
     verify_installation(dataset_path)

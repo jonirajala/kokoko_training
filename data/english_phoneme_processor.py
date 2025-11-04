@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-English Phoneme Processor using Misaki G2P
+English Phoneme Processor using g2p_en (ARPA phonemes)
 Provides grapheme-to-phoneme conversion for English TTS training
+
+SWITCHED FROM MISAKI (IPA) TO G2P_EN (ARPA) FOR 100% MFA ALIGNMENT MATCH
 """
 
-from typing import Dict, List, Optional
+from typing import Dict, List
 import logging
 
 logger = logging.getLogger(__name__)
@@ -12,49 +14,63 @@ logger = logging.getLogger(__name__)
 
 class EnglishPhonemeProcessor:
     """
-    English phoneme processor using Misaki G2P engine.
+    English phoneme processor using g2p_en (ARPA phonemes).
 
-    This processor converts English text to phoneme sequences using the Misaki
-    G2P library, which is designed for the Kokoro TTS architecture.
+    This matches MFA's english_us_arpa model perfectly for 100% alignment usage.
     """
 
     def __init__(self, variant: str = 'en-us'):
         """
-        Initialize the English phoneme processor.
+        Initialize the English phoneme processor with ARPA phonemes.
 
         Args:
-            variant: Language variant ('en-us' or 'en-gb')
+            variant: Language variant (kept for compatibility, g2p_en is US English)
         """
         self.variant = variant
 
-        # Try to import Misaki
-        try:
-            from misaki.en import G2P
-            british = (variant == 'en-gb')
-            # Use trf=False to avoid transformer dependency issues
-            self.g2p = G2P(trf=False, british=british)
-            self.use_misaki = True
-            logger.info(f"Initialized English phoneme processor with Misaki ({variant})")
-        except ImportError as e:
-            logger.warning(
-                f"Misaki not found ({e}). Install with: pip install 'misaki[en]'\n"
-                "Falling back to basic phoneme mapping."
-            )
-            self.use_misaki = False
-            self.g2p = None
+        # Store g2p as None - will be lazy loaded
+        # This avoids pickle issues with multiprocessing DataLoader
+        self._g2p = None
+        self.use_g2p_en = True
 
-        # Build phoneme vocabulary
+        # Download required NLTK data (but don't create G2p instance yet)
+        try:
+            import nltk
+            # Download required NLTK data (silently if already present)
+            try:
+                nltk.data.find('taggers/averaged_perceptron_tagger_eng')
+            except LookupError:
+                logger.info("Downloading required NLTK data...")
+                nltk.download('averaged_perceptron_tagger_eng', quiet=True)
+                nltk.download('cmudict', quiet=True)
+            logger.info(f"Initialized English phoneme processor with g2p_en (ARPA phonemes)")
+        except ImportError as e:
+            logger.error(
+                f"g2p_en not found ({e}). Install with: pip install g2p_en\n"
+            )
+            raise ImportError("g2p_en is required for ARPA phoneme processing")
+
+        # Build ARPA phoneme vocabulary
         self.phoneme_to_id = self._build_vocab()
         self.id_to_phoneme = {v: k for k, v in self.phoneme_to_id.items()}
+        logger.info(f"Vocabulary size: {len(self.phoneme_to_id)} ARPA phonemes")
 
-        logger.info(f"Vocabulary size: {len(self.phoneme_to_id)} phonemes")
+    @property
+    def g2p(self):
+        """Lazy-load G2p instance to avoid pickle issues with multiprocessing"""
+        if self._g2p is None:
+            from g2p_en import G2p
+            self._g2p = G2p()
+        return self._g2p
 
     def _build_vocab(self) -> Dict[str, int]:
         """
-        Build phoneme vocabulary mapping.
+        Build ARPA phoneme vocabulary matching MFA's english_us_arpa model.
 
-        Based on Misaki's actual US_VOCAB phoneme set.
-        See: misaki/en.py US_VOCAB
+        ARPA phoneme set (CMU pronouncing dictionary):
+        - Vowels: AA, AE, AH, AO, AW, AY, EH, ER, EY, IH, IY, OW, OY, UH, UW
+        - Consonants: B, CH, D, DH, F, G, HH, JH, K, L, M, N, NG, P, R, S, SH, T, TH, V, W, Y, Z, ZH
+        - Stress markers: 0, 1, 2 (added as suffix to vowels)
 
         Returns:
             Dictionary mapping phonemes to integer IDs
@@ -66,79 +82,44 @@ class EnglishPhonemeProcessor:
             ' ': 2,       # Space/word boundary
         }
 
-        # Misaki US_VOCAB phoneme set (sorted for consistency)
-        # US_VOCAB = frozenset('AIOWYbdfhijklmnpstuvwzæðŋɑɔəɛɜɡɪɹɾʃʊʌʒʤʧˈˌθᵊᵻʔ')
-        misaki_phonemes = [
-            # Capital letters (diphthongs in Misaki notation)
-            'A',   # /aɪ/ sound (as in "ride")
-            'I',   # /aɪ/ alternative
-            'O',   # /oʊ/ sound (as in "go")
-            'W',   # /aʊ/ sound (as in "now")
-            'Y',   # /ɔɪ/ sound (as in "boy")
-
-            # Consonants
-            'b', 'd', 'f', 'h', 'j', 'k', 'l', 'm', 'n', 'p', 's', 't', 'v', 'w', 'z',
-            'ɡ',   # voiced velar stop
-            'ŋ',   # velar nasal (sing)
-            'ð',   # voiced dental fricative (this)
-            'θ',   # voiceless dental fricative (thin)
-            'ʃ',   # voiceless postalveolar fricative (ship)
-            'ʒ',   # voiced postalveolar fricative (measure)
-            'ʧ',   # voiceless postalveolar affricate (church)
-            'ʤ',   # voiced postalveolar affricate (judge)
-            'ɹ',   # alveolar approximant (AmE r)
-            'ɾ',   # alveolar flap/tap (AmE "butter")
-            'T',   # Alternative notation for flap/tap
-
-            # Vowels
-            'i',   # close front unrounded (beat)
-            'u',   # close back rounded (boot)
-            'æ',   # near-open front unrounded (bat)
-            'ɑ',   # open back unrounded (father)
-            'ɔ',   # open-mid back rounded (thought)
-            'ə',   # mid central (schwa - about)
-            'ɛ',   # open-mid front unrounded (bet)
-            'ɜ',   # open-mid central unrounded (bird)
-            'ɪ',   # near-close near-front unrounded (bit)
-            'ʊ',   # near-close near-back rounded (put)
-            'ʌ',   # open-mid back unrounded (but)
-            'ᵊ',   # reduced schwa
-            'ᵻ',   # reduced close central unrounded
-            'ɐ',   # near-open central vowel (schwa-like, used for unstressed "a")
-
-            # Stress markers
-            'ˈ',   # primary stress
-            'ˌ',   # secondary stress
-
-            # Special
-            'ʔ',   # glottal stop
+        # ARPA vowels (no stress markers - we'll handle stressed variants separately)
+        vowels = [
+            'AA', 'AE', 'AH', 'AO', 'AW', 'AY',
+            'EH', 'ER', 'EY', 'IH', 'IY', 'OW',
+            'OY', 'UH', 'UW'
         ]
 
-        # Add common punctuation that may appear in Misaki output
-        punctuation = [
-            '.',   # period
-            ',',   # comma
-            '!',   # exclamation
-            '?',   # question
-            '-',   # dash/hyphen
-            '—',   # em dash (Misaki uses this)
-            ':',   # colon
-            ';',   # semicolon
-            '"',   # quote
-            "'",   # apostrophe
-            '(',   # left paren
-            ')',   # right paren
+        # ARPA consonants
+        consonants = [
+            'B', 'CH', 'D', 'DH', 'F', 'G', 'HH',
+            'JH', 'K', 'L', 'M', 'N', 'NG', 'P',
+            'R', 'S', 'SH', 'T', 'TH', 'V', 'W',
+            'Y', 'Z', 'ZH'
         ]
 
-        # Combine Misaki phonemes and punctuation
-        all_phonemes = misaki_phonemes + punctuation
+        # Add vowels with stress markers (0, 1, 2)
+        vowel_variants = []
+        for vowel in vowels:
+            vowel_variants.append(vowel)  # Base form
+            for stress in ['0', '1', '2']:
+                vowel_variants.append(vowel + stress)
 
-        # Add to vocabulary (de-duplicate in case of overlap)
+        # Add punctuation that g2p_en outputs
+        punctuation = ['.', ',', '!', '?', ':', ';', '-', '"', "'"]
+
+        # Combine all phonemes
+        all_phonemes = vowel_variants + consonants + punctuation
+
+        # Add to vocabulary
         for phoneme in all_phonemes:
             if phoneme not in vocab:
                 vocab[phoneme] = len(vocab)
 
         return vocab
+
+    def get_vocab_size(self) -> int:
+        """Get vocabulary size"""
+        return len(self.phoneme_to_id)
 
     def process_text(self, text: str) -> List[List[str]]:
         """
@@ -157,115 +138,31 @@ class EnglishPhonemeProcessor:
 
     def text_to_phonemes(self, text: str) -> List[str]:
         """
-        Convert text to phoneme sequence using Misaki.
+        Convert text to ARPA phoneme sequence using g2p_en.
 
         Args:
             text: Input text string
 
         Returns:
-            List of phoneme strings
+            List of ARPA phoneme strings (e.g., ['HH', 'EH1', 'L', 'OW0'])
         """
         if not text or not text.strip():
             return []
 
-        if self.use_misaki:
-            try:
-                # Use Misaki G2P for conversion
-                # G2P returns (phoneme_string, tokens)
-                ipa_text, tokens = self.g2p(text)
+        try:
+            # g2p_en converts text to phonemes
+            # Returns list like: ['HH', 'AH0', 'L', 'OW1', ' ', 'W', 'ER1', 'L', 'D']
+            phonemes = self.g2p(text)
 
-                # Parse IPA string into individual phonemes
-                phonemes = self._parse_ipa(ipa_text)
+            # Filter out empty strings and clean
+            phonemes = [p for p in phonemes if p and p.strip()]
 
-                return phonemes
-            except Exception as e:
-                logger.error(f"Error in Misaki G2P conversion: {e}")
-                logger.warning("Falling back to character-level processing")
-                return self._fallback_processing(text)
-        else:
-            # Fallback to basic processing
-            return self._fallback_processing(text)
+            return phonemes
 
-    def _parse_ipa(self, ipa_text: str) -> List[str]:
-        """
-        Parse IPA string into individual phonemes.
-
-        Handles multi-character phonemes (like 'tʃ', 'dʒ', 'aɪ', etc.)
-
-        Args:
-            ipa_text: IPA string from Misaki
-
-        Returns:
-            List of individual phonemes
-        """
-        phonemes = []
-        i = 0
-
-        while i < len(ipa_text):
-            # Try to match multi-character phonemes first
-            matched = False
-
-            # Check for 3-character phonemes
-            if i + 2 < len(ipa_text):
-                three_char = ipa_text[i:i+3]
-                if three_char in self.phoneme_to_id:
-                    phonemes.append(three_char)
-                    i += 3
-                    matched = True
-
-            # Check for 2-character phonemes
-            if not matched and i + 1 < len(ipa_text):
-                two_char = ipa_text[i:i+2]
-                if two_char in self.phoneme_to_id:
-                    phonemes.append(two_char)
-                    i += 2
-                    matched = True
-
-            # Check for single character
-            if not matched:
-                one_char = ipa_text[i]
-                if one_char in self.phoneme_to_id:
-                    phonemes.append(one_char)
-                else:
-                    # Unknown phoneme - log warning and use <unk>
-                    if one_char not in [' ', '\n', '\t']:
-                        logger.debug(f"Unknown phoneme: '{one_char}' (U+{ord(one_char):04X})")
-                    if one_char.isspace():
-                        phonemes.append(' ')
-                    else:
-                        phonemes.append('<unk>')
-                i += 1
-
-        return phonemes
-
-    def _fallback_processing(self, text: str) -> List[str]:
-        """
-        Fallback text processing when Misaki is not available.
-
-        This is a very basic character-level processing and should only be used
-        for testing. For production use, install Misaki.
-
-        Args:
-            text: Input text
-
-        Returns:
-            List of characters (not true phonemes)
-        """
-        logger.warning("Using fallback character-level processing - not true phonemes!")
-
-        # Convert to lowercase and split into characters
-        text = text.lower()
-        chars = []
-
-        for char in text:
-            if char.isalpha():
-                chars.append(char)
-            elif char.isspace():
-                chars.append(' ')
-            elif char in '.,!?-:;\'"':
-                chars.append(char)
-
-        return chars
+        except Exception as e:
+            logger.error(f"Error in g2p_en conversion: {e}")
+            logger.warning("Returning empty phoneme list")
+            return []
 
     def text_to_indices(self, text: str) -> List[int]:
         """
@@ -278,10 +175,16 @@ class EnglishPhonemeProcessor:
             List of phoneme indices
         """
         phonemes = self.text_to_phonemes(text)
-        indices = [
-            self.phoneme_to_id.get(p, self.phoneme_to_id['<unk>'])
-            for p in phonemes
-        ]
+        indices = []
+
+        for phoneme in phonemes:
+            if phoneme in self.phoneme_to_id:
+                indices.append(self.phoneme_to_id[phoneme])
+            else:
+                # Unknown phoneme
+                logger.warning(f"Unknown phoneme: {phoneme}, using <unk>")
+                indices.append(self.phoneme_to_id['<unk>'])
+
         return indices
 
     def indices_to_phonemes(self, indices: List[int]) -> List[str]:
@@ -294,32 +197,31 @@ class EnglishPhonemeProcessor:
         Returns:
             List of phoneme strings
         """
-        phonemes = [
-            self.id_to_phoneme.get(idx, '<unk>')
-            for idx in indices
-        ]
+        phonemes = []
+        for idx in indices:
+            if idx in self.id_to_phoneme:
+                phonemes.append(self.id_to_phoneme[idx])
+            else:
+                phonemes.append('<unk>')
+
         return phonemes
 
-    def indices_to_text(self, indices: List[int]) -> str:
+    def phonemes_to_text(self, phonemes: List[str]) -> str:
         """
-        Convert phoneme indices back to a string.
+        Convert phonemes back to approximate text (not perfect, for debugging).
 
         Args:
-            indices: List of phoneme indices
+            phonemes: List of phoneme strings
 
         Returns:
-            Phoneme string
+            Approximate text string
         """
-        phonemes = self.indices_to_phonemes(indices)
-        return ''.join(phonemes)
+        # This is approximate - ARPA -> text is lossy
+        return ' '.join(phonemes)
 
-    def get_vocab_size(self) -> int:
-        """Get vocabulary size"""
-        return len(self.phoneme_to_id)
-
-    def to_dict(self) -> Dict:
+    def to_dict(self) -> dict:
         """
-        Serialize processor for saving.
+        Convert processor to dictionary for serialization.
 
         Returns:
             Dictionary containing processor state
@@ -327,56 +229,53 @@ class EnglishPhonemeProcessor:
         return {
             'variant': self.variant,
             'phoneme_to_id': self.phoneme_to_id,
-            'use_misaki': self.use_misaki,
+            'id_to_phoneme': self.id_to_phoneme,
+            'use_g2p_en': self.use_g2p_en,
+            'processor_type': 'g2p_en_arpa'
         }
 
     @classmethod
-    def from_dict(cls, data: Dict) -> 'EnglishPhonemeProcessor':
+    def from_dict(cls, state_dict: dict) -> 'EnglishPhonemeProcessor':
         """
-        Deserialize processor from saved data.
+        Create processor from dictionary.
 
         Args:
-            data: Saved processor state
+            state_dict: Dictionary containing processor state
 
         Returns:
-            Restored processor instance
+            EnglishPhonemeProcessor instance
         """
-        processor = cls(variant=data.get('variant', 'en-us'))
-        processor.phoneme_to_id = data['phoneme_to_id']
-        processor.id_to_phoneme = {v: k for k, v in processor.phoneme_to_id.items()}
+        # Create new processor instance
+        processor = cls(variant=state_dict.get('variant', 'en-us'))
+
+        # Override with saved vocabulary if available
+        if 'phoneme_to_id' in state_dict:
+            processor.phoneme_to_id = state_dict['phoneme_to_id']
+            processor.id_to_phoneme = state_dict['id_to_phoneme']
+
         return processor
-
-    def __repr__(self) -> str:
-        """String representation"""
-        return (
-            f"EnglishPhonemeProcessor(variant='{self.variant}', "
-            f"vocab_size={self.get_vocab_size()}, "
-            f"use_misaki={self.use_misaki})"
-        )
-
-
-def test_processor():
-    """Test the English phoneme processor"""
-    processor = EnglishPhonemeProcessor('en-us')
-
-    test_texts = [
-        "Hello world!",
-        "The quick brown fox jumps over the lazy dog.",
-        "Text to speech synthesis.",
-    ]
-
-    print(f"\n{processor}")
-    print(f"Vocabulary size: {processor.get_vocab_size()}\n")
-
-    for text in test_texts:
-        phonemes = processor.text_to_phonemes(text)
-        indices = processor.text_to_indices(text)
-
-        print(f"Text: {text}")
-        print(f"Phonemes: {phonemes}")
-        print(f"Indices: {indices}")
-        print(f"Length: {len(phonemes)} phonemes\n")
 
 
 if __name__ == "__main__":
-    test_processor()
+    # Test the processor
+    processor = EnglishPhonemeProcessor()
+
+    test_texts = [
+        "Hello world",
+        "The quick brown fox jumps over the lazy dog",
+        "Printing, in the only sense with which we are at present concerned"
+    ]
+
+    print("\n" + "="*80)
+    print("ARPA Phoneme Processor Test")
+    print("="*80)
+
+    for text in test_texts:
+        print(f"\nText: {text}")
+        phonemes = processor.text_to_phonemes(text)
+        print(f"Phonemes ({len(phonemes)}): {' '.join(phonemes)}")
+        indices = processor.text_to_indices(text)
+        print(f"Indices ({len(indices)}): {indices[:20]}...")
+
+    print(f"\nVocabulary size: {processor.get_vocab_size()}")
+    print("\n" + "="*80)

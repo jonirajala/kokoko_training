@@ -134,83 +134,115 @@ class LJSpeechDataset(Dataset):
         """
         Load real phoneme durations from MFA TextGrid file.
 
+        NO SILENT FALLBACKS - Will raise errors if MFA alignments are missing or invalid.
+        This ensures you know immediately if there's a problem with alignments.
+
         Args:
-            alignment_path: Path to TextGrid alignment file (None for fallback)
+            alignment_path: Path to TextGrid alignment file
             phoneme_count: Number of phonemes (for validation)
-            mel_frame_count: Total mel frames (for fallback calculation)
+            mel_frame_count: Total mel frames (for validation)
 
         Returns:
             Tensor of phoneme durations (in mel frames)
+
+        Raises:
+            ValueError: If alignment file is missing or invalid
+            ImportError: If textgrid library is not installed
         """
-        if alignment_path is None or not Path(alignment_path).exists():
-            # Fallback to uniform distribution
-            return self._generate_uniform_durations(phoneme_count, mel_frame_count)
+        # NO FALLBACK: Raise error if alignment path is missing
+        if alignment_path is None:
+            raise ValueError(
+                "MFA alignment path is None! This should never happen.\n"
+                "Check that alignment_path is set correctly in dataset samples."
+            )
 
+        if not Path(alignment_path).exists():
+            raise FileNotFoundError(
+                f"MFA alignment file not found: {alignment_path}\n"
+                f"Run: python setup_ljspeech.py --align-only\n"
+                f"to generate proper IPA alignments matching Misaki G2P."
+            )
+
+        # NO FALLBACK: Raise error if textgrid library missing
         try:
-            # Try to import textgrid library
-            try:
-                import textgrid
-            except ImportError:
-                logger.warning(
-                    "textgrid library not found. Install with: pip install textgrid\n"
-                    "Falling back to uniform durations."
-                )
-                return self._generate_uniform_durations(phoneme_count, mel_frame_count)
+            import textgrid
+        except ImportError as e:
+            raise ImportError(
+                "textgrid library not installed!\n"
+                "Install with: pip install textgrid\n"
+                f"Original error: {e}"
+            )
 
-            # Load TextGrid file
-            tg = textgrid.TextGrid.fromFile(alignment_path)
+        # Load TextGrid file
+        tg = textgrid.TextGrid.fromFile(alignment_path)
 
-            # Find the phones tier (MFA usually names it 'phones' or 'phonemes')
-            phones_tier = None
-            for tier in tg.tiers:
-                if tier.name.lower() in ['phones', 'phone', 'phonemes', 'phoneme']:
-                    phones_tier = tier
-                    break
+        # Find the phones tier (MFA usually names it 'phones' or 'phonemes')
+        phones_tier = None
+        for tier in tg.tiers:
+            if tier.name.lower() in ['phones', 'phone', 'phonemes', 'phoneme']:
+                phones_tier = tier
+                break
 
-            if phones_tier is None:
-                logger.debug(f"No phones tier found in {alignment_path}, using fallback")
-                return self._generate_uniform_durations(phoneme_count, mel_frame_count)
+        # NO FALLBACK: Raise error if no phones tier
+        if phones_tier is None:
+            available_tiers = [t.name for t in tg.tiers]
+            raise ValueError(
+                f"No phones tier found in {alignment_path}!\n"
+                f"Available tiers: {available_tiers}\n"
+                f"MFA should create a 'phones' tier. Re-run alignment."
+            )
 
-            # Extract durations in seconds
-            durations_sec = []
-            for interval in phones_tier:
-                # Skip empty intervals and silence markers
-                if interval.mark and interval.mark.strip() and interval.mark.lower() not in ['sil', 'sp', '']:
-                    duration = interval.maxTime - interval.minTime
-                    durations_sec.append(duration)
+        # Extract durations in seconds
+        durations_sec = []
+        for interval in phones_tier:
+            # Skip empty intervals and silence markers
+            if interval.mark and interval.mark.strip() and interval.mark.lower() not in ['sil', 'sp', '']:
+                duration = interval.maxTime - interval.minTime
+                durations_sec.append(duration)
 
-            # Convert to mel frames
-            # mel_frames = duration_sec * sample_rate / hop_length
-            durations_frames = [
-                int(d * self.config.sample_rate / self.config.hop_length)
-                for d in durations_sec
-            ]
+        # Convert to mel frames
+        # mel_frames = duration_sec * sample_rate / hop_length
+        durations_frames = [
+            int(d * self.config.sample_rate / self.config.hop_length)
+            for d in durations_sec
+        ]
 
-            # Ensure minimum duration of 1 frame
-            durations_frames = [max(1, d) for d in durations_frames]
+        # Ensure minimum duration of 1 frame
+        durations_frames = [max(1, d) for d in durations_frames]
 
-            # Validate length matches phonemes (approximately)
-            # Note: MFA phoneme count might differ slightly from our G2P output
-            if abs(len(durations_frames) - phoneme_count) > phoneme_count * 0.2:
-                logger.debug(
-                    f"Duration count ({len(durations_frames)}) differs significantly from "
-                    f"phoneme count ({phoneme_count}). Using fallback."
-                )
-                return self._generate_uniform_durations(phoneme_count, mel_frame_count)
+        # Validate length matches phonemes (approximately)
+        # Now using ARPA (g2p_en) which matches MFA's ARPA perfectly!
+        # Tolerance set to 15% to handle minor differences in word pronunciations
+        # (g2p_en vs MFA dictionary may differ slightly for some words)
+        mismatch_pct = abs(len(durations_frames) - phoneme_count) / phoneme_count if phoneme_count > 0 else 1.0
 
-            # Adjust durations to match phoneme count if needed
-            if len(durations_frames) != phoneme_count:
-                durations_frames = self._adjust_duration_count(
-                    durations_frames,
-                    phoneme_count,
-                    mel_frame_count
-                )
+        if mismatch_pct > 0.15:
+            raise ValueError(
+                f"Phoneme count mismatch in {alignment_path}!\n"
+                f"MFA phonemes: {len(durations_frames)}, G2P phonemes: {phoneme_count}\n"
+                f"Mismatch: {mismatch_pct*100:.1f}% (threshold: 10%)\n"
+                f"\n"
+                f"This means your MFA alignments don't match Misaki G2P phoneme set.\n"
+                f"Solution: Re-run alignment with custom IPA dictionary:\n"
+                f"  python setup_ljspeech.py --align-only\n"
+                f"\n"
+                f"If you're certain alignments are correct, increase tolerance in\n"
+                f"data/ljspeech_dataset.py line ~195"
+            )
 
-            return torch.tensor(durations_frames, dtype=torch.long)
+        # Adjust durations to match phoneme count if needed (minor differences)
+        if len(durations_frames) != phoneme_count:
+            logger.debug(
+                f"Minor phoneme count difference ({len(durations_frames)} vs {phoneme_count}), "
+                f"adjusting durations..."
+            )
+            durations_frames = self._adjust_duration_count(
+                durations_frames,
+                phoneme_count,
+                mel_frame_count
+            )
 
-        except Exception as e:
-            logger.debug(f"Error loading MFA durations from {alignment_path}: {e}")
-            return self._generate_uniform_durations(phoneme_count, mel_frame_count)
+        return torch.tensor(durations_frames, dtype=torch.long)
 
     def _adjust_duration_count(
         self,
@@ -329,11 +361,9 @@ class LJSpeechDataset(Dataset):
             # Convert to mel spectrogram
             mel_spec = self.mel_transform(waveform).squeeze(0).T  # [time, n_mels]
 
-            # Apply log scaling
+            # Apply log scaling with proper clamping
+            # CRITICAL FIX: Clamp to valid log-mel range [-11.5, 0.0]
             mel_spec = torch.log(torch.clamp(mel_spec, min=1e-5))
-
-            # Clip outliers to reasonable log-mel range
-            # Keep in natural log-mel space for vocoder compatibility (NO z-scoring!)
             mel_spec = torch.clamp(mel_spec, min=-11.5, max=0.0)
 
             # Clip to max sequence length

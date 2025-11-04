@@ -281,6 +281,11 @@ class KokoroModel(nn.Module):
     def _predict_durations(self, text_encoded: torch.Tensor) -> torch.Tensor:
         """
         Predicts log durations for each phoneme with optional checkpointing
+
+        CRITICAL FIX: Clamps log-durations to prevent catastrophic expansion
+        - log(0.1) ≈ -2.3 → min 0.1 frames
+        - log(100) ≈ 4.6 → max 100 frames
+        Without this, predicted durations can explode to 11,000+ frames per phoneme!
         """
         with torch.profiler.record_function("predict_durations"):
             # Log before duration prediction (outside any checkpointed regions)
@@ -292,6 +297,11 @@ class KokoroModel(nn.Module):
                 log_durations = checkpoint(self.duration_predictor, text_encoded, use_reentrant=False).squeeze(-1)
             else:
                 log_durations = self.duration_predictor(text_encoded).squeeze(-1)
+
+            # CRITICAL FIX: Clamp log-durations to prevent catastrophic expansion
+            # This prevents exp(9.3) = 11,000 frames per phoneme!
+            # Reasonable range: [0.1, 100] frames per phoneme
+            log_durations = torch.clamp(log_durations, min=-2.3, max=4.6)
 
             # Log after duration prediction (outside any checkpointed regions)
             if self.enable_profiling:

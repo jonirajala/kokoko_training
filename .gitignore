@@ -89,3 +89,7 @@ htmlcov/
 # Profiling
 *.prof
 *.lprof
+
+
+*.sh
+*.dict
