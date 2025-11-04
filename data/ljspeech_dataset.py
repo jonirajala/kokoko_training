@@ -34,18 +34,14 @@ class LJSpeechDataset(Dataset):
         self.phoneme_processor = EnglishPhonemeProcessor(variant='en-us')
 
         # TextGrid files from MFA (optional)
-        self.alignment_dir = self.data_dir / "TextGrid"
+        # Note: MFA outputs to TextGrid/wavs/ subdirectory
+        self.alignment_dir = self.data_dir / "TextGrid" / "wavs"
         self.has_alignments = self.alignment_dir.exists()
 
         if self.has_alignments:
             logger.info(f"Found MFA alignments at: {self.alignment_dir}")
         else:
-            logger.warning(
-                f"No MFA alignments found at {self.alignment_dir}. "
-                "Will use uniform duration fallback. For better quality, "
-                "run Montreal Forced Aligner on your dataset."
-            )
-
+            raise ValueError(f"No MFA alignments found at {self.alignment_dir}")
         # Validate MelSpectrogram parameters
         if self.config.win_length > self.config.n_fft:
             raise ValueError(
@@ -164,10 +160,10 @@ class LJSpeechDataset(Dataset):
             # Load TextGrid file
             tg = textgrid.TextGrid.fromFile(alignment_path)
 
-            # Find the phones tier (MFA usually names it 'phones')
+            # Find the phones tier (MFA usually names it 'phones' or 'phonemes')
             phones_tier = None
             for tier in tg.tiers:
-                if tier.name.lower() in ['phones', 'phone']:
+                if tier.name.lower() in ['phones', 'phone', 'phonemes', 'phoneme']:
                     phones_tier = tier
                     break
 
@@ -335,6 +331,10 @@ class LJSpeechDataset(Dataset):
 
             # Apply log scaling
             mel_spec = torch.log(torch.clamp(mel_spec, min=1e-5))
+
+            # Clip outliers to reasonable log-mel range
+            # Keep in natural log-mel space for vocoder compatibility (NO z-scoring!)
+            mel_spec = torch.clamp(mel_spec, min=-11.5, max=0.0)
 
             # Clip to max sequence length
             max_frames = self.config.max_seq_length

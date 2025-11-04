@@ -114,6 +114,7 @@ class KokoroModel(nn.Module):
         )
 
         # Output projection for Mel Spectrogram
+        # No activation or scaling - let the network learn the log-mel range naturally
         self.mel_projection_out = nn.Linear(hidden_dim, mel_dim)
 
         # End-of-Speech (Stop Token) Predictor

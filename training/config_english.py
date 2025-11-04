@@ -58,9 +58,9 @@ class EnglishTrainingConfig:
     encoder_dropout: float = 0.1        # Dropout rate
     max_decoder_seq_len: int = 4000     # Maximum decoder sequence length
 
-    # Loss weights
-    duration_loss_weight: float = 0.25  # Weight for duration prediction loss
-    stop_token_loss_weight: float = 0.5 # Weight for stop token loss
+    # Loss weights (UPDATED after debugging)
+    duration_loss_weight: float = 1.0  # Weight for duration prediction loss (was 0.25)
+    stop_token_loss_weight: float = 0.1 # Weight for stop token loss (was 0.5)
 
     # Audio processing parameters (optimized for LJSpeech)
     max_seq_length: int = 2500          # Maximum mel frame sequence length
