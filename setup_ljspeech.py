@@ -251,8 +251,37 @@ def run_mfa_alignment(dataset_path: str, use_custom_dict: bool = False):
     # Create parent TextGrid directory
     (dataset_path / "TextGrid").mkdir(parents=True, exist_ok=True)
 
+    # Step 1: Create individual .txt files for MFA (required!)
+    logger.info("\n" + "="*70)
+    logger.info("Step 1/4: Creating transcription files for MFA")
+    logger.info("="*70)
+
+    metadata_file = dataset_path / "metadata.csv"
+    if not metadata_file.exists():
+        logger.error(f"metadata.csv not found at {metadata_file}")
+        sys.exit(1)
+
+    logger.info(f"Reading metadata from {metadata_file}...")
+    txt_created = 0
+    with open(metadata_file, 'r', encoding='utf-8') as f:
+        for line in f:
+            parts = line.strip().split('|')
+            if len(parts) >= 2:
+                file_id = parts[0]
+                transcription = parts[1]
+
+                # Create .txt file alongside .wav file
+                txt_path = corpus_path / f"{file_id}.txt"
+                if not txt_path.exists():
+                    with open(txt_path, 'w', encoding='utf-8') as txt_f:
+                        txt_f.write(transcription)
+                    txt_created += 1
+
+    logger.info(f"✓ Created {txt_created} transcription .txt files")
+    logger.info(f"✓ MFA can now align audio with transcriptions")
+
     try:
-        # Step 1: Custom dictionary (legacy - not needed with g2p_en)
+        # Step 2: Custom dictionary (legacy - not needed with g2p_en)
         custom_dict_path = None
         if use_custom_dict:
             logger.warning("\n⚠️  Custom dictionary generation is legacy functionality")
@@ -260,9 +289,9 @@ def run_mfa_alignment(dataset_path: str, use_custom_dict: bool = False):
             logger.info("\nFalling back to standard english_us_arpa dictionary...")
             custom_dict_path = None
 
-        # Step 2: Download dictionary and acoustic model
+        # Step 3: Download dictionary and acoustic model
         logger.info("\n" + "="*70)
-        logger.info("Step 2/4: Downloading MFA models")
+        logger.info("Step 3/4: Downloading MFA models")
         logger.info("="*70)
 
         logger.info("Downloading english_us_arpa dictionary...")
@@ -277,9 +306,9 @@ def run_mfa_alignment(dataset_path: str, use_custom_dict: bool = False):
             check=True
         )
 
-        # Step 3: Run alignment
+        # Step 4: Run alignment
         logger.info("\n" + "="*70)
-        logger.info("Step 3/4: Running forced alignment")
+        logger.info("Step 4/4: Running forced alignment")
         logger.info("="*70)
 
         logger.info(f"Input corpus: {corpus_path}")
