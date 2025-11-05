@@ -290,6 +290,11 @@ class KokoroEnglishTTS:
             # Remove batch dimension and move to CPU for vocoder
             mel_spec = mel_spec.squeeze(0).cpu()
 
+            # CRITICAL: Transpose mel from (frames, mel_dim) to (mel_dim, frames) for vocoder
+            # Model outputs (batch, frames, mel_dim), after squeeze we get (frames, mel_dim)
+            # But vocoder expects (mel_dim, frames) - standard mel spectrogram format
+            mel_spec = mel_spec.transpose(0, 1)
+
             logger.info(f"✓ Generated mel spectrogram")
             logger.info(f"Mel shape: {mel_spec.shape} (channels={mel_spec.shape[0]}, frames={mel_spec.shape[1]})")
             logger.info(f"Mel range: [{mel_spec.min().item():.3f}, {mel_spec.max().item():.3f}]")
