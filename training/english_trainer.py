@@ -640,13 +640,13 @@ class EnglishTrainer:
                             f"Current LR: {current_lr:.8f}")
 
                 # Log skipped samples if any
-                if hasattr(self.train_dataset, 'skipped_samples') and self.train_dataset.skipped_samples > 0:
-                    skipped = self.train_dataset.skipped_samples
-                    total = len(self.train_dataset)
+                if hasattr(self.dataset, 'skipped_samples') and self.dataset.skipped_samples > 0:
+                    skipped = self.dataset.skipped_samples
+                    total = len(self.dataset)
                     pct = (skipped / total) * 100
                     logger.info(f"Skipped {skipped}/{total} samples ({pct:.1f}%) due to phoneme mismatches (OOV words, special chars)")
                     # Reset counter for next epoch
-                    self.train_dataset.skipped_samples = 0
+                    self.dataset.skipped_samples = 0
 
                 # Log memory management stats for this epoch
                 if self.enable_adaptive_memory:
