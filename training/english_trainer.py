@@ -338,15 +338,61 @@ class EnglishTrainer:
 
                 self.optimizer.zero_grad()
 
-                # Forward pass
+                # ========== Scheduled Sampling ==========
+                # Gradually expose model to its own predictions to reduce exposure bias
+                # Critical for preventing garbage audio at inference
+                decoder_input_mels = None  # None = use ground truth (teacher forcing)
+                use_gt_durs = (epoch < getattr(self.config, 'use_gt_durations_until_epoch', 0))
+
+                if getattr(self.config, 'enable_scheduled_sampling', False):
+                    # Calculate scheduled sampling probability based on global step
+                    warmup = getattr(self.config, 'scheduled_sampling_warmup_batches', 500)
+                    max_prob = getattr(self.config, 'scheduled_sampling_max_prob', 0.5)
+
+                    if global_step < warmup:
+                        scheduled_sampling_prob = 0.0  # Pure teacher forcing
+                    elif global_step < warmup * 2:
+                        scheduled_sampling_prob = 0.1  # Gentle exposure
+                    elif global_step < warmup * 4:
+                        scheduled_sampling_prob = 0.3  # Building robustness
+                    else:
+                        scheduled_sampling_prob = max_prob  # Full exposure
+
+                    # Apply scheduled sampling
+                    sample_mode = torch.rand(1).item()
+                    zero_ratio = getattr(self.config, 'scheduled_sampling_zero_input_ratio', 0.3)
+
+                    if sample_mode < scheduled_sampling_prob * zero_ratio:
+                        # Zero-input training (hardest - like inference start)
+                        decoder_input_mels = torch.zeros_like(mel_specs)
+                    elif sample_mode < scheduled_sampling_prob:
+                        # Use model's predictions as input
+                        with torch.no_grad():
+                            if self.use_mixed_precision:
+                                with self.get_autocast_context():
+                                    mel_pred_sample, _, _ = self.model(
+                                        phoneme_indices, mel_specs, phoneme_durations,
+                                        stop_token_targets, use_gt_durations=False
+                                    )
+                            else:
+                                mel_pred_sample, _, _ = self.model(
+                                    phoneme_indices, mel_specs, phoneme_durations,
+                                    stop_token_targets, use_gt_durations=False
+                                )
+                        decoder_input_mels = mel_pred_sample.detach()
+                    # else: decoder_input_mels stays None (teacher forcing with ground truth)
+
+                # Forward pass with scheduled sampling
                 with torch.profiler.record_function("Model_Forward"):
                     if self.use_mixed_precision:
                         with self.get_autocast_context():
                             predicted_mel, predicted_log_durations, predicted_stop_logits = \
-                                self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets)
+                                self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
+                                          use_gt_durations=use_gt_durs, decoder_input_mels=decoder_input_mels)
                     else:
                         predicted_mel, predicted_log_durations, predicted_stop_logits = \
-                            self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets)
+                            self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
+                                      use_gt_durations=use_gt_durs, decoder_input_mels=decoder_input_mels)
 
                 # Loss calculation
                 with torch.profiler.record_function("Loss_Calculation"):
@@ -538,6 +584,24 @@ class EnglishTrainer:
             logger.info(f"Initial learning rate: {self.config.learning_rate}")
             logger.info(f"Scheduler: CosineAnnealingWarmRestarts (T_0={self.config.lr_T_0}, T_mult={self.config.lr_T_mult}, eta_min={self.config.lr_eta_min})")
             logger.info(f"Loss weights: Mel={1.0}, Duration={self.config.duration_loss_weight}, StopToken={self.config.stop_token_loss_weight}")
+
+            # Log scheduled sampling configuration
+            if getattr(self.config, 'enable_scheduled_sampling', False):
+                logger.info("Scheduled Sampling: ENABLED (critical for inference quality)")
+                logger.info(f"  Warmup batches: {getattr(self.config, 'scheduled_sampling_warmup_batches', 500)}")
+                logger.info(f"  Max probability: {getattr(self.config, 'scheduled_sampling_max_prob', 0.5)}")
+                logger.info(f"  Zero-input ratio: {getattr(self.config, 'scheduled_sampling_zero_input_ratio', 0.3)}")
+                logger.info("  Schedule: 0-500 batches (prob=0.0), 500-1000 (0.1), 1000-2000 (0.3), 2000+ (0.5)")
+            else:
+                logger.warning("⚠️  Scheduled Sampling: DISABLED - Model may produce garbage audio at inference!")
+                logger.warning("   Enable with 'enable_scheduled_sampling: True' in config")
+
+            # Log ground truth durations usage
+            use_gt_durs_epochs = getattr(self.config, 'use_gt_durations_until_epoch', 0)
+            if use_gt_durs_epochs > 0:
+                logger.info(f"Ground Truth Durations: Using GT durations for first {use_gt_durs_epochs} epochs")
+            else:
+                logger.info("Ground Truth Durations: DISABLED (training duration predictor from start)")
 
             enable_profiling = getattr(self.config, 'enable_profiling', False)
             if enable_profiling:
@@ -1148,16 +1212,22 @@ class EnglishTrainer:
                 with torch.profiler.record_function("Zero_Grad"):
                     self.optimizer.zero_grad()
 
+                # Note: Scheduled sampling disabled during profiling for consistent measurements
+                # (profiling is typically done for short runs, not full training)
+                use_gt_durs = False  # Use duration predictor during profiling
+
                 # Forward pass with mixed precision
                 self.interbatch_profiler.start_forward_pass()
                 with torch.profiler.record_function("Model_Forward"):
                     if self.use_mixed_precision:
                         with self.get_autocast_context():
                             predicted_mel, predicted_log_durations, predicted_stop_logits = \
-                                self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets)
+                                self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
+                                          use_gt_durations=use_gt_durs)
                     else:
                         predicted_mel, predicted_log_durations, predicted_stop_logits = \
-                            self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets)
+                            self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
+                                      use_gt_durations=use_gt_durs)
                 self.interbatch_profiler.end_forward_pass()
 
                 self.log_memory_stats("forward_pass")

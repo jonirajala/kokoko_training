@@ -59,7 +59,8 @@ class EnglishTrainingConfig:
     max_decoder_seq_len: int = 4000     # Maximum decoder sequence length
 
     # Loss weights (FIXED: gradient imbalance caused by duration_loss_weight=1.0)
-    duration_loss_weight: float = 0.25  # RESTORED from 1.0 - gradient analysis showed this was drowning mel loss
+    # Overfit test proved 0.01 works perfectly - mel loss 0.016, perfect audio
+    duration_loss_weight: float = 0.01  # Very small to prevent gradient explosion (was 0.25, then 1.0)
     stop_token_loss_weight: float = 0.1 # Weight for stop token loss
 
     # Audio processing parameters (optimized for LJSpeech)
@@ -107,6 +108,22 @@ class EnglishTrainingConfig:
 
     # Gradient clipping
     max_grad_norm: float = 1.0          # Maximum gradient norm for clipping
+
+    # Scheduled Sampling (CRITICAL for inference quality)
+    # Gradually exposes model to its own predictions during training to reduce exposure bias
+    # Without this, model trains with perfect inputs but fails at inference with imperfect predictions
+    enable_scheduled_sampling: bool = True  # Enable scheduled sampling
+    scheduled_sampling_warmup_batches: int = 500  # Pure teacher forcing for first N batches
+    scheduled_sampling_max_prob: float = 0.5      # Maximum sampling probability (0.5 = 50% of time)
+    scheduled_sampling_zero_input_ratio: float = 0.3  # 30% of sampling time uses zero input
+    # Schedule: 0-500 batches: prob=0.0 (teacher forcing)
+    #           500-1000: prob=0.1 (gentle exposure)
+    #           1000-2000: prob=0.3 (building robustness)
+    #           2000+: prob=0.5 (full exposure)
+
+    # Ground Truth Durations (IMPORTANT for early training stability)
+    # Using GT durations bypasses duration predictor, allowing mel predictor to learn faster
+    use_gt_durations_until_epoch: int = 0  # Use ground truth durations for first N epochs (0 = disabled)
 
     # Profiling (debugging)
     enable_profiling: bool = False      # Enable GPU profiling

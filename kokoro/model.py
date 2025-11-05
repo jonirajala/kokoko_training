@@ -447,10 +447,17 @@ class KokoroModel(nn.Module):
         stop_token_targets: torch.Tensor,
         text_padding_mask: Optional[torch.Tensor] = None,
         mel_padding_mask: Optional[torch.Tensor] = None,
-        use_gt_durations: bool = False
+        use_gt_durations: bool = False,
+        decoder_input_mels: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Enhanced training forward pass with gradient checkpointing enabled by default
+
+        Args:
+            decoder_input_mels: Optional mel spectrograms to use as decoder input.
+                              If None, uses mel_specs with teacher forcing (standard training).
+                              For scheduled sampling, pass model predictions or zeros.
+                              Shape: (batch, mel_seq_len, mel_dim)
         """
         with torch.profiler.record_function("forward_training"):
             batch_size, mel_seq_len = mel_specs.shape[0], mel_specs.shape[1]
@@ -520,7 +527,13 @@ class KokoroModel(nn.Module):
                         self.profiler.log_memory_stats("decoder_input_prep_start")
 
                     # Prepare decoder input with checkpointing
-                    decoder_input_mels = F.pad(mel_specs[:, :-1, :], (0, 0, 1, 0), "constant", 0.0)
+                    # Use provided decoder_input_mels if available (for scheduled sampling),
+                    # otherwise use mel_specs with teacher forcing (standard training)
+                    if decoder_input_mels is None:
+                        decoder_input_mels = mel_specs
+
+                    # Shift right by 1 position (teacher forcing / scheduled sampling)
+                    decoder_input_mels = F.pad(decoder_input_mels[:, :-1, :], (0, 0, 1, 0), "constant", 0.0)
 
                     if self.gradient_checkpointing and self.training:
                         decoder_input_projected = checkpoint(
@@ -690,19 +703,14 @@ class KokoroModel(nn.Module):
                                 )
 
                                 decoder_out_t = decoder_outputs[:, -1:, :]
-                                # CRITICAL FIX: Use coarse + postnet for inference too
+                                # Generate COARSE mel only (no PostNet yet)
+                                # PostNet will be applied to complete sequence at the end
                                 mel_coarse_t = self.mel_projection_coarse(decoder_out_t)
-                                # For autoregressive generation, apply postnet to single frame
-                                # This is suboptimal (postnet designed for full sequences) but necessary
-                                mel_residual_t = self.postnet(mel_coarse_t)
-                                # Scale residual by 0.5 to match training
-                                mel_pred_t = mel_coarse_t + 0.5 * mel_residual_t
 
-                                # CRITICAL: Clamp mel to vocoder's training range [-11.5, 0.0]
-                                # Vocoder (HiFi-GAN) was trained on this range; values outside cause garbage audio
-                                mel_pred_t = torch.clamp(mel_pred_t, min=-11.5, max=0.0)
+                                # Clamp coarse prediction for stability
+                                mel_coarse_t = torch.clamp(mel_coarse_t, min=-11.5, max=0.0)
 
-                                generated_mels.append(mel_pred_t)
+                                generated_mels.append(mel_coarse_t)
 
                                 stop_token_logit_t = self.stop_token_predictor(decoder_out_t)
                                 stop_probability = torch.sigmoid(stop_token_logit_t).item()
@@ -716,7 +724,7 @@ class KokoroModel(nn.Module):
                                         logger.info(f"Stopping at expected length {t} (stop_prob: {stop_probability:.4f})")
                                         break
 
-                                decoder_input_mel = mel_pred_t
+                                decoder_input_mel = mel_coarse_t
 
                                 # Log every 50 steps during inference (outside any checkpointed regions)
                                 if self.enable_profiling and t % 50 == 0:
@@ -734,9 +742,22 @@ class KokoroModel(nn.Module):
                     generation_time = time.time() - generation_start_time
 
                     if generated_mels:
-                        mel_output = torch.cat(generated_mels, dim=1)
-                        logger.info(f"Generated {mel_output.shape[1]} mel frames in {generation_time:.2f}s "
-                                   f"({mel_output.shape[1]/generation_time:.1f} frames/s)")
+                        # Concatenate coarse mel predictions
+                        mel_coarse_sequence = torch.cat(generated_mels, dim=1)
+                        logger.info(f"Generated {mel_coarse_sequence.shape[1]} coarse mel frames in {generation_time:.2f}s "
+                                   f"({mel_coarse_sequence.shape[1]/generation_time:.1f} frames/s)")
+
+                        # Apply PostNet to COMPLETE sequence (not frame-by-frame)
+                        # This is the key fix: PostNet uses Conv1D with kernel_size=5
+                        # It needs full sequence context to work properly
+                        with torch.profiler.record_function("inference_postnet"):
+                            mel_residual = self.postnet(mel_coarse_sequence)
+                            mel_output = mel_coarse_sequence + 0.5 * mel_residual
+
+                            # Final clamp to vocoder range
+                            mel_output = torch.clamp(mel_output, min=-11.5, max=0.0)
+
+                        logger.info(f"Applied PostNet to complete sequence")
                     else:
                         logger.warning("No mel frames were generated.")
                         mel_output = torch.empty(batch_size, 0, self.mel_dim, device=device)
@@ -760,10 +781,16 @@ class KokoroModel(nn.Module):
         phoneme_durations: Optional[torch.Tensor] = None,
         stop_token_targets: Optional[torch.Tensor] = None,
         text_padding_mask: Optional[torch.Tensor] = None,
-        mel_padding_mask: Optional[torch.Tensor] = None
+        mel_padding_mask: Optional[torch.Tensor] = None,
+        use_gt_durations: bool = False,
+        decoder_input_mels: Optional[torch.Tensor] = None
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
         Main forward pass that dispatches to training or inference mode.
+
+        Args:
+            use_gt_durations: If True, bypass duration predictor and use ground truth durations
+            decoder_input_mels: Optional mel spectrograms for decoder input (scheduled sampling)
         """
         if mel_specs is not None:
             self.train()
@@ -771,7 +798,8 @@ class KokoroModel(nn.Module):
                 raise ValueError("phoneme_durations and stop_token_targets must be provided for training mode.")
             return self.forward_training(
                 phoneme_indices, mel_specs, phoneme_durations,
-                stop_token_targets, text_padding_mask, mel_padding_mask
+                stop_token_targets, text_padding_mask, mel_padding_mask,
+                use_gt_durations, decoder_input_mels
             )
         else:
             self.eval()

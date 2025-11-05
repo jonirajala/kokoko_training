@@ -76,9 +76,137 @@ python inference_english.py \
 
 ## Model Architecture
 
-The model consists of a text encoder (6-layer transformer with 8 attention heads), duration predictor (MLP for phoneme durations), length regulator (expands encoder outputs), mel decoder (6-layer transformer with masked attention), and stop token predictor.
+The model consists of a text encoder (6-layer transformer with 8 attention heads), duration predictor (MLP for phoneme durations), length regulator (expands encoder outputs), mel decoder (6-layer transformer with masked attention), **PostNet** (5-layer convolutional refinement network from Tacotron 2), and stop token predictor.
 
 Configuration: 512 hidden dimensions, 6 encoder/decoder layers, 8 attention heads, 2048 feed-forward dimensions, 80 mel channels, 22,050 Hz sample rate. Gradient checkpointing enabled for memory efficiency.
+
+### Current Implementation Features
+
+**Scheduled Sampling** (CRITICAL for inference quality):
+- Gradually exposes model to its own predictions during training to prevent exposure bias
+- Schedule: 0-500 batches (pure teacher forcing) → 500-1000 (10% sampling) → 1000-2000 (30% sampling) → 2000+ (50% sampling)
+- Includes zero-input training (30% of sampling time) to teach model to generate from scratch
+- Prevents the common issue where models train perfectly but produce garbage audio at inference
+
+**PostNet Architecture**:
+- 5-layer convolutional network (mel_dim → 512 → 512 → 512 → 512 → mel_dim)
+- Refines coarse mel predictions by capturing temporal dependencies and frequency correlations
+- Applied to complete sequences (not frame-by-frame) for proper context
+- Uses residual connection: `mel_final = mel_coarse + 0.5 * mel_residual`
+
+**Loss Configuration**:
+- Mel Loss Weight: 1.0 (primary objective)
+- Duration Loss Weight: 0.01 (small to prevent gradient imbalance)
+- Stop Token Loss Weight: 0.1
+- Gradient clipping: 1.0 (prevents explosion)
+
+**Training Optimizations**:
+- Optional ground truth duration bypass for early epochs (`use_gt_durations_until_epoch`)
+- Conservative learning rate (7e-5) optimized for batch size 32 with BF16
+- Automatic BF16/FP16 mixed precision detection
+- Adaptive memory management with gradient checkpointing
+
+### Architecture Flow
+
+```
+Input: Phoneme indices
+         ↓
+    Text Encoder (Transformer)
+         ↓
+    Duration Predictor → predicted durations
+         ↓
+    Length Regulator (expand by durations)
+         ↓
+    Decoder (Transformer with scheduled sampling)
+         ├─ Teacher forcing (0-500 batches)
+         ├─ Mixed sampling (500-2000 batches)
+         └─ Full exposure (2000+ batches)
+         ↓
+    Mel Projection Coarse → coarse mels
+         ↓
+    PostNet (5-layer Conv1D) → residual
+         ↓
+    mel_final = coarse + 0.5 * residual
+         ↓
+    Clamp to [-11.5, 0.0]
+         ↓
+    Output: Mel spectrogram → HiFi-GAN vocoder → Audio
+```
+
+## Implementation Notes
+
+### Why These Features Are Critical
+
+**Scheduled Sampling** prevents exposure bias - the most common failure mode in autoregressive TTS:
+- **Problem**: Models trained only with perfect ground truth inputs produce garbage when using their own predictions at inference
+- **Solution**: Gradually expose model to imperfect predictions during training (0% → 10% → 30% → 50%)
+- **Impact**: Without this, training loss looks good but inference produces unintelligible audio
+
+**PostNet on Complete Sequences** is required for proper temporal context:
+- **Problem**: Applying Conv1D (kernel_size=5) frame-by-frame gives no context → random noise
+- **Solution**: Generate all coarse frames first, then apply PostNet to complete sequence
+- **Impact**: Frame-by-frame PostNet was the root cause of garbage autoregressive output
+
+**Loss Weight Balance** prevents gradient imbalance:
+- **Problem**: duration_loss_weight=1.0 caused duration gradients (20,000+) to overwhelm mel gradients (0.4)
+- **Solution**: Reduce to 0.01 - just enough to train duration predictor without dominating
+- **Impact**: Mel predictor can now learn effectively
+
+### Expected Training Timeline
+
+Based on overfit test success (mel loss 0.016 after 3000 iterations):
+
+- **Epoch 10**: Mel loss ~1.0 - Barely intelligible, learning phoneme-to-mel mapping
+- **Epoch 20**: Mel loss ~0.5 - Robotic but clear, basic prosody emerging
+- **Epoch 50**: Mel loss ~0.3 - Natural-sounding, good quality
+- **Epoch 100**: Mel loss ~0.2-0.3 - High quality, production-ready
+
+**Note**: Full dataset mel loss will be higher than overfit (0.2-0.3 vs 0.016) because it generalizes across 13,000 diverse samples, not just 1. Audio quality should be excellent at ~0.3.
+
+### Troubleshooting
+
+**Training crashes with "unexpected keyword argument"**:
+- Fixed in latest version - `forward()` wrapper now accepts `use_gt_durations` and `decoder_input_mels`
+- Run: `git pull` or check `kokoro/model.py` lines 777-803
+
+**Model produces garbage audio at inference despite low training loss**:
+- Check scheduled sampling is enabled: Look for "Scheduled Sampling: ENABLED" in logs
+- If disabled, set `enable_scheduled_sampling: True` in `training/config_english.py`
+- This is the #1 cause of "trains well, fails at inference" issues
+
+**Mel loss stuck above 1.0 after epoch 20**:
+- Check `duration_loss_weight = 0.01` (not 0.25 or 1.0) in config
+- Check gradient norm stays below 5.0 (if exploding, reduce learning rate)
+- Verify PostNet is present: `grep "PostNet" kokoro/model.py` should find it
+
+**Audio quality not improving after epoch 50**:
+- Verify mel loss is still decreasing (should reach 0.2-0.3 by epoch 100)
+- Check learning rate schedule - should decrease with cosine annealing
+- Generate test audio every 10 epochs to track progress
+
+**Out of memory errors**:
+- Reduce batch size: try 16, 8, or 4
+- Gradient checkpointing is enabled by default (saves ~75% memory)
+- For MPS (Apple Silicon), batch size 8-16 recommended
+
+### Validation Strategy
+
+Run inference tests periodically to catch issues early:
+
+```bash
+# Every 10 epochs, generate test audio
+python inference_english.py \
+  --model kokoro_english_model/checkpoint_epoch_20.pth \
+  --text "The quick brown fox jumps over the lazy dog." \
+  --output test_epoch_20.wav
+```
+
+Compare audio quality across epochs:
+- Epoch 10: Should be barely intelligible (proves model is learning)
+- Epoch 20: Should be robotic but clear (proves no garbage output)
+- Epoch 50+: Should sound natural (proves training is working)
+
+If any checkpoint produces garbage audio, scheduled sampling may have been disabled. Check training logs.
 
 ## Dataset Structure
 

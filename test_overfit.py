@@ -3,7 +3,7 @@
 Overfit Test - Train on a single sample to verify model can learn
 This is a critical sanity check for debugging TTS training issues.
 
-If the model can't overfit a single sample after 1000 iterations,
+If the model can't overfit a single sample after 3000 iterations,
 there's a fundamental bug in the architecture or training loop.
 """
 
@@ -39,7 +39,7 @@ class SingleSampleDataset:
 
 def test_overfit():
     """
-    Overfit test: Train on a single sample for 1000 iterations
+    Overfit test: Train on a single sample for 3000 iterations
     """
 
     logger.info("="*70)
@@ -235,12 +235,17 @@ def test_overfit():
     duration_loss_weight = 0.01  # Very small - just enough to train duration predictor
     stop_token_loss_weight = 0.1  # Small weight
 
+    # Scheduled sampling: gradually increase probability of using predictions vs ground truth
+    scheduled_sampling_prob = 0.0  # Start with full teacher forcing
+
     logger.info(f"Loss weights: mel={mel_loss_weight}, duration={duration_loss_weight}, stop={stop_token_loss_weight}")
+    logger.info(f"Scheduled sampling probability: {scheduled_sampling_prob:.2f}")
     logger.info("Using teacher-forced mel (ground truth as decoder input) + training duration predictor")
 
-    # Training loop
+    # Training loop - extended for better convergence
+    num_iterations = 3000  # Increased from 3000 to get lower mel loss
     logger.info("\n" + "="*70)
-    logger.info("Starting overfit training (1000 iterations with low LR)")
+    logger.info(f"Starting overfit training ({num_iterations} iterations)")
     logger.info("="*70 + "\n")
 
     model.train()
@@ -258,10 +263,46 @@ def test_overfit():
     dur_losses = []
     stop_losses = []
 
-    progress_bar = tqdm(range(1000), desc="Overfitting")
+    progress_bar = tqdm(range(num_iterations), desc="Overfitting")
 
     for iteration in progress_bar:
         optimizer.zero_grad(set_to_none=True)
+
+        # Update scheduled sampling probability based on iteration
+        if iteration < 500:
+            scheduled_sampling_prob = 0.0  # Pure teacher forcing
+        elif iteration < 1000:
+            scheduled_sampling_prob = 0.1  # Gentle exposure
+        elif iteration < 2000:
+            scheduled_sampling_prob = 0.3  # Building robustness
+        else:
+            scheduled_sampling_prob = 0.5  # Full exposure
+
+        # Scheduled sampling: mix ground truth, predictions, and zeros for decoder input
+        # This helps the model learn to generate from scratch (like inference)
+        sample_mode = torch.rand(1).item()
+
+        if sample_mode < scheduled_sampling_prob * 0.3:  # 30% of sampling = zeros
+            # Train with ZERO decoder input (hardest - like inference start)
+            decoder_input_mels = torch.zeros_like(mel_spec)
+        elif sample_mode < scheduled_sampling_prob:  # Remaining sampling = predictions
+            # Use scheduled sampling: decoder sees its own predictions
+            with torch.no_grad():
+                # Get predictions without gradients for sampling
+                mel_pred_sample, _, _ = model.forward_training(
+                    phoneme_indices=phoneme_indices,
+                    mel_specs=mel_spec,
+                    phoneme_durations=durations,
+                    stop_token_targets=stop_tokens,
+                    text_padding_mask=None,
+                    mel_padding_mask=None,
+                    use_gt_durations=False
+                )
+            # Use predicted mels as decoder input (detached to avoid double gradients)
+            decoder_input_mels = mel_pred_sample.detach()
+        else:
+            # Use ground truth mels as decoder input (teacher forcing)
+            decoder_input_mels = mel_spec
 
         # Forward pass with mixed precision (match real training!)
         # Use ground truth durations for length regulation (teacher forcing for decoder)
@@ -270,7 +311,7 @@ def test_overfit():
             with torch.amp.autocast("cuda", dtype=autocast_dtype):
                 mel_pred, dur_pred, stop_pred = model.forward_training(
                     phoneme_indices=phoneme_indices,
-                    mel_specs=mel_spec,
+                    mel_specs=decoder_input_mels,  # Use scheduled sampling mels
                     phoneme_durations=durations,
                     stop_token_targets=stop_tokens,
                     text_padding_mask=None,
@@ -280,7 +321,7 @@ def test_overfit():
         else:
             mel_pred, dur_pred, stop_pred = model.forward_training(
                 phoneme_indices=phoneme_indices,
-                mel_specs=mel_spec,
+                mel_specs=decoder_input_mels,  # Use scheduled sampling mels
                 phoneme_durations=durations,
                 stop_token_targets=stop_tokens,
                 text_padding_mask=None,
@@ -329,13 +370,13 @@ def test_overfit():
             if grad_norm_before_clip < 1e-6:
                 logger.error(f"  ❌ VANISHING GRADIENTS! Norm = {grad_norm_before_clip:.10f}")
 
-            # Verify duration predictor has no gradients
+            # Verify duration predictor is training
             if iteration == 10:
                 dur_has_grad = any(p.grad is not None for p in model.duration_predictor.parameters())
                 if dur_has_grad:
-                    logger.error(f"  ❌ WARNING: Duration predictor HAS gradients (should be frozen)!")
+                    logger.info(f"  ✓ Duration predictor has gradients (training correctly)")
                 else:
-                    logger.info(f"  ✓ Duration predictor has no gradients (correctly frozen)")
+                    logger.error(f"  ❌ WARNING: Duration predictor has NO gradients!")
 
         # Check for divergence and stop early
         if torch.isnan(total_loss) or total_loss.item() > 1e6:
@@ -400,6 +441,7 @@ def test_overfit():
             logger.info(f"  Mel Loss: {mel_loss.item():.6f}")
             logger.info(f"  Duration Loss: {dur_loss.item():.6f}")
             logger.info(f"  Stop Loss: {stop_loss.item():.6f}")
+            logger.info(f"  Scheduled sampling prob: {scheduled_sampling_prob:.2f}")
 
             # Check mel prediction statistics
             logger.info(f"  Mel pred range: [{mel_pred.min().item():.3f}, {mel_pred.max().item():.3f}]")
@@ -407,8 +449,8 @@ def test_overfit():
             logger.info(f"  Mel pred std: {mel_pred.std().item():.3f}")
             logger.info(f"  Mel target std: {mel_spec.std().item():.3f}")
 
-            # Duration predictor is frozen and bypassed (using ground truth durations)
-            logger.info(f"  Duration predictor: FROZEN (using ground truth durations)")
+            # Duration predictor is being trained (needed for inference)
+            logger.info(f"  Duration predictor: TRAINING (dur_loss={dur_loss.item():.6f})")
 
             # Check gradient flow to decoder/PostNet instead
             if hasattr(model, 'mel_projection_coarse') and model.mel_projection_coarse.weight.grad is not None:
@@ -459,7 +501,7 @@ def test_overfit():
     final_dur_loss = dur_losses[-1]
     final_stop_loss = stop_losses[-1]
 
-    logger.info(f"\nFinal losses after 1000 iterations:")
+    logger.info(f"\nFinal losses after 3000 iterations:")
     logger.info(f"  Total Loss: {final_total_loss:.6f}")
     logger.info(f"  Mel Loss: {final_mel_loss:.6f}")
     logger.info(f"  Duration Loss: {final_dur_loss:.6f}")
@@ -487,7 +529,7 @@ def test_overfit():
     # Save model checkpoint
     checkpoint = {
         'model_state_dict': model.state_dict(),
-        'iteration': 1000,
+        'iteration': num_iterations,
         'loss': final_total_loss,
         'sample_idx': sample_idx,
         'sample_text': sample['text']
@@ -542,8 +584,127 @@ def test_overfit():
     with torch.no_grad():
         logger.info(f"\nGenerating audio for: '{sample['text']}'")
 
-        # Run inference on SINGLE sample (not batch)
-        phoneme_indices_single = phoneme_indices[:1]  # Take first sample from batch
+        # FIRST: Generate audio from GROUND TRUTH mel (reference quality)
+        logger.info("\n--- Ground Truth Mel (Reference) ---")
+        phoneme_indices_single = phoneme_indices[:1]
+        durations_single = durations[:1]
+        mel_spec_single = mel_spec[:1]
+        stop_tokens_single = stop_tokens[:1]
+
+        logger.info(f"Ground truth mel shape: {mel_spec_single.shape}")
+        logger.info(f"Ground truth mel range: [{mel_spec_single.min().item():.3f}, {mel_spec_single.max().item():.3f}]")
+
+        # Generate audio from ground truth mels
+        logger.info("\nGenerating audio from ground truth mels (reference quality)...")
+        mel_for_vocoder_gt = mel_spec_single.squeeze(0).transpose(0, 1).cpu()  # (mel_dim, frames)
+
+        from audio.vocoder_manager import VocoderManager
+        vocoder_manager = VocoderManager(vocoder_type="hifigan", device=device.type)
+        audio_gt = vocoder_manager.mel_to_audio(mel_for_vocoder_gt)
+
+        output_path_gt = output_dir / "ground_truth_audio.wav"
+        import torchaudio
+        torchaudio.save(str(output_path_gt), audio_gt.unsqueeze(0), 22050)
+        logger.info(f"✓ Ground truth audio saved to: {output_path_gt}")
+        logger.info(f"Audio duration: {len(audio_gt) / 22050:.2f}s")
+
+        # SECOND: Test with teacher-forced forward pass (should be near-perfect)
+        logger.info("\n--- Teacher-Forced Pass (using ground truth durations) ---")
+
+        mel_pred_tf, dur_pred_tf, stop_pred_tf = model.forward_training(
+            phoneme_indices=phoneme_indices_single,
+            mel_specs=mel_spec_single,
+            phoneme_durations=durations_single,
+            stop_token_targets=stop_tokens_single,
+            text_padding_mask=None,
+            mel_padding_mask=None,
+            use_gt_durations=False
+        )
+
+        # Check teacher-forced quality
+        tf_mel_loss = nn.L1Loss()(mel_pred_tf, mel_spec_single).item()
+        tf_correlation = torch.corrcoef(torch.stack([
+            mel_pred_tf.flatten(),
+            mel_spec_single.flatten()
+        ]))[0, 1].item()
+
+        logger.info(f"Teacher-forced mel loss: {tf_mel_loss:.6f}")
+        logger.info(f"Teacher-forced correlation: {tf_correlation:.4f}")
+        logger.info(f"Teacher-forced mel range: [{mel_pred_tf.min().item():.3f}, {mel_pred_tf.max().item():.3f}]")
+
+        # Generate audio from teacher-forced mels
+        logger.info("\nGenerating audio from teacher-forced mels...")
+        mel_for_vocoder_tf = mel_pred_tf.squeeze(0).transpose(0, 1).cpu()  # (mel_dim, frames)
+
+        # Reuse the same vocoder instance
+        audio_tf = vocoder_manager.mel_to_audio(mel_for_vocoder_tf)
+
+        output_path_tf = output_dir / "overfit_teacher_forced.wav"
+        import torchaudio
+        torchaudio.save(str(output_path_tf), audio_tf.unsqueeze(0), 22050)
+        logger.info(f"✓ Teacher-forced audio saved to: {output_path_tf}")
+        logger.info(f"Audio duration: {len(audio_tf) / 22050:.2f}s")
+
+        # SECOND: Test with ground truth durations (best case scenario)
+        logger.info("\n--- Inference with Ground Truth Durations ---")
+        logger.info("Using GT durations but zero-initialized decoder input...")
+
+        # Use GROUND TRUTH durations for best case
+        logger.info(f"Using ground truth durations: {durations_single[0].cpu().tolist()[:10]}...")
+
+        # Generate using parallel decoding - try iterative refinement
+        # Start with zeros, then refine
+        decoder_input_iter = torch.zeros_like(mel_spec_single)
+
+        num_refinement_steps = 5
+        logger.info(f"Performing {num_refinement_steps} refinement steps...")
+
+        for refine_step in range(num_refinement_steps):
+            with torch.no_grad():
+                mel_pred_iter, _, _ = model.forward_training(
+                    phoneme_indices=phoneme_indices_single,
+                    mel_specs=decoder_input_iter,
+                    phoneme_durations=durations_single,  # Use GT durations
+                    stop_token_targets=stop_tokens_single,
+                    text_padding_mask=None,
+                    mel_padding_mask=None,
+                    use_gt_durations=False
+                )
+                # Use prediction as next input (iterative refinement)
+                decoder_input_iter = mel_pred_iter.detach()
+
+                if refine_step == 0:
+                    mel_loss_iter = nn.L1Loss()(mel_pred_iter, mel_spec_single).item()
+                    logger.info(f"  Step {refine_step}: mel_loss={mel_loss_iter:.4f}")
+
+        # Final refinement
+        mel_pred_parallel, _, _ = model.forward_training(
+            phoneme_indices=phoneme_indices_single,
+            mel_specs=decoder_input_iter,
+            phoneme_durations=durations_single,  # Use GT durations
+            stop_token_targets=stop_tokens_single,
+            text_padding_mask=None,
+            mel_padding_mask=None,
+            use_gt_durations=False
+        )
+
+        mel_loss_final = nn.L1Loss()(mel_pred_parallel, mel_spec_single).item()
+        logger.info(f"  Final: mel_loss={mel_loss_final:.4f}")
+        logger.info(f"Parallel generated mel shape: {mel_pred_parallel.shape}")
+        logger.info(f"Parallel mel range: [{mel_pred_parallel.min().item():.3f}, {mel_pred_parallel.max().item():.3f}]")
+
+        # Generate audio from parallel inference
+        logger.info("\nGenerating audio from iterative refinement...")
+        mel_for_vocoder_parallel = mel_pred_parallel.squeeze(0).transpose(0, 1).cpu()
+        audio_parallel = vocoder_manager.mel_to_audio(mel_for_vocoder_parallel)
+
+        output_path_parallel = output_dir / "overfit_parallel.wav"
+        torchaudio.save(str(output_path_parallel), audio_parallel.unsqueeze(0), 22050)
+        logger.info(f"✓ Parallel inference audio saved to: {output_path_parallel}")
+        logger.info(f"Audio duration: {len(audio_parallel) / 22050:.2f}s")
+
+        # THIRD: Test with autoregressive inference (for comparison)
+        logger.info("\n--- Autoregressive Inference (Original) ---")
         mel_output = model.forward_inference(
             phoneme_indices=phoneme_indices_single,
             max_len=400,
@@ -551,9 +712,9 @@ def test_overfit():
             text_padding_mask=None
         )
 
-        logger.info(f"Generated mel shape: {mel_output.shape}")
+        logger.info(f"Autoregressive mel shape: {mel_output.shape}")
         logger.info(f"Target mel shape: {mel_spec.shape}")
-        logger.info(f"Generated mel range: [{mel_output.min().item():.3f}, {mel_output.max().item():.3f}]")
+        logger.info(f"Autoregressive mel range: [{mel_output.min().item():.3f}, {mel_output.max().item():.3f}]")
         logger.info(f"Target mel range: [{mel_spec.min().item():.3f}, {mel_spec.max().item():.3f}]")
 
         # Remove batch dimension and transpose for vocoder

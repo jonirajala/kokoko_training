@@ -38,7 +38,9 @@ This implementation differs fundamentally: uses a simple encoder-decoder transfo
 
 ## Files
 
-`model.py` contains the complete Kokoro TTS model with text encoder (Transformer), duration predictor (MLP), length regulator (duration expansion), mel decoder (Transformer), and stop token predictor. Main methods are `forward()` for training with teacher forcing, `inference()` for autoregressive generation, and `get_model_info()` for parameter stats.
+`model.py` contains the complete Kokoro TTS model with text encoder (Transformer), duration predictor (MLP), length regulator (duration expansion), mel decoder (Transformer), **PostNet** (5-layer convolutional refinement), and stop token predictor. Main methods are `forward_training()` for training with scheduled sampling and teacher forcing, `forward_inference()` for autoregressive generation, and `get_model_info()` for parameter stats.
+
+`postnet.py` implements the PostNet architecture from Tacotron 2 - a 5-layer convolutional network that refines coarse mel predictions by capturing temporal dependencies and frequency correlations. Includes both standard PostNet and LightweightPostnet variants.
 
 `model_transformers.py` implements the transformer encoder and decoder blocks with multi-head self-attention and gradient checkpointing support.
 
@@ -47,13 +49,35 @@ This implementation differs fundamentally: uses a simple encoder-decoder transfo
 ## Architecture Overview
 
 ```
-Text → Encoder → Duration → Length → Decoder → Mel Spectrogram
-                 Predictor   Regulator         + Stop Token
+Text → Encoder → Duration → Length → Decoder → Mel Coarse → PostNet → Mel Final
+                 Predictor   Regulator                      + Stop Token
 ```
 
-Training flow uses teacher forcing: text becomes phoneme indices, encoder processes phoneme sequence, duration predictor predicts phoneme durations, length regulator expands encoder outputs, decoder generates mel frames using ground truth as input, outputting mel spectrogram and stop tokens.
+**Training flow** uses scheduled sampling and teacher forcing:
+- Text becomes phoneme indices
+- Encoder processes phoneme sequence
+- Duration predictor predicts phoneme durations (or uses ground truth if `use_gt_durations=True`)
+- Length regulator expands encoder outputs by durations
+- Decoder generates mel frames using:
+  - **Teacher forcing**: Ground truth mels as decoder input (0-500 batches)
+  - **Scheduled sampling**: Mix of ground truth, model predictions, and zeros (500+ batches)
+  - **Zero-input training**: Decoder learns to generate from scratch (30% of sampling)
+- Mel projection generates coarse predictions
+- **PostNet** refines predictions with 5-layer Conv1D (applied to complete sequence)
+- Final output: `mel_final = mel_coarse + 0.5 * mel_residual`
+- Stop token predictor indicates sequence end
 
-Inference flow is autoregressive: same initial steps, but decoder generates mel frames step-by-step until stop token threshold is reached.
+**Inference flow** is autoregressive with sequence-level PostNet:
+1. Encode text, predict durations, expand encoder outputs
+2. Generate all coarse mel frames autoregressively (one at a time)
+3. Apply PostNet to **complete** coarse sequence (not frame-by-frame)
+4. Output refined mel spectrogram until stop token threshold reached
+
+**Key Implementation Details**:
+- **Scheduled Sampling**: Prevents exposure bias by gradually exposing model to imperfect predictions during training
+- **PostNet on Complete Sequence**: Conv1D (kernel_size=5) needs temporal context - applying frame-by-frame produces garbage
+- **Zero-Input Training**: Teaches model to bootstrap from nothing, like inference start conditions
+- **Loss Balance**: duration_loss_weight=0.01 prevents duration gradients from overwhelming mel learning
 
 ## Model Parameters
 
@@ -76,16 +100,51 @@ model = KokoroModel(
     n_decoder_layers=6
 )
 
-# Training
+# Training with scheduled sampling (recommended)
+mel_pred, duration_pred, stop_pred = model.forward_training(
+    phoneme_indices=phoneme_indices,
+    mel_specs=mel_specs,
+    phoneme_durations=phoneme_durations,
+    stop_token_targets=stop_token_targets,
+    use_gt_durations=False,  # Set True to bypass duration predictor
+    decoder_input_mels=None  # For scheduled sampling: pass predictions or zeros
+)
+
+# Training with scheduled sampling - zero input
+decoder_input_zeros = torch.zeros_like(mel_specs)
+mel_pred, duration_pred, stop_pred = model.forward_training(
+    phoneme_indices=phoneme_indices,
+    mel_specs=mel_specs,
+    phoneme_durations=phoneme_durations,
+    stop_token_targets=stop_token_targets,
+    decoder_input_mels=decoder_input_zeros  # Train to generate from scratch
+)
+
+# Inference (autoregressive)
+mel_output = model.forward_inference(
+    phoneme_indices=phoneme_indices,
+    max_len=1000,
+    stop_threshold=0.5
+)
+
+# Legacy forward() wrapper (for backward compatibility)
 mel_pred, duration_pred, stop_pred = model(
     phoneme_indices,
     mel_specs,
     phoneme_durations,
     stop_token_targets
 )
-
-# Inference
-mel_output = model.inference(phoneme_indices, max_mel_len=1000)
 ```
+
+**Key Training Features**:
+- `use_gt_durations=True`: Bypass duration predictor for faster mel learning (useful for first few epochs)
+- `decoder_input_mels=None`: Standard teacher forcing (uses ground truth)
+- `decoder_input_mels=zeros`: Zero-input training (teaches model to generate from scratch)
+- `decoder_input_mels=predictions`: Scheduled sampling (uses model's own predictions)
+
+**Inference Notes**:
+- PostNet is automatically applied to the complete sequence (not frame-by-frame)
+- Mel values are clamped to [-11.5, 0.0] to match vocoder training range
+- Stop threshold 0.5 means generation stops when sigmoid(stop_logit) > 0.5
 
 Requires PyTorch 2.0+. Gradient checkpointing trades compute for memory. GPUProfiler is a lightweight stub. Supports CUDA, MPS (Apple Silicon), and CPU.
