@@ -262,7 +262,47 @@ def run_mfa_alignment(dataset_path: str, use_custom_dict: bool = False):
         sys.exit(1)
 
     logger.info(f"Reading metadata from {metadata_file}...")
+
+    # Import text normalization
+    import re
+    try:
+        import inflect
+        p = inflect.engine()
+        has_inflect = True
+    except ImportError:
+        logger.warning("inflect not installed - numbers will be kept as-is (may cause mismatches)")
+        logger.warning("Install with: pip install inflect")
+        has_inflect = False
+
+    def normalize_text(text):
+        """Normalize text to match what g2p_en expects"""
+        if not has_inflect:
+            return text
+
+        # Convert numbers to words (handles years, decimals, etc.)
+        def convert_number(match):
+            num_str = match.group(0)
+            try:
+                # Try to convert to number and then to words
+                if '.' in num_str:
+                    return p.number_to_words(float(num_str))
+                else:
+                    num = int(num_str)
+                    # For years (4 digits), say as individual digits pairs
+                    if 1000 <= num <= 2099:
+                        # e.g., 1929 -> "nineteen twenty nine"
+                        return p.number_to_words(num, group=2)
+                    else:
+                        return p.number_to_words(num)
+            except:
+                return num_str
+
+        # Replace numbers with words
+        text = re.sub(r'\b\d+\.?\d*\b', convert_number, text)
+        return text
+
     txt_created = 0
+    txt_normalized = 0
     with open(metadata_file, 'r', encoding='utf-8') as f:
         for line in f:
             parts = line.strip().split('|')
@@ -270,15 +310,21 @@ def run_mfa_alignment(dataset_path: str, use_custom_dict: bool = False):
                 file_id = parts[0]
                 transcription = parts[1]
 
+                # Normalize text so MFA and g2p_en see the same thing
+                normalized_text = normalize_text(transcription)
+                if normalized_text != transcription:
+                    txt_normalized += 1
+
                 # Create .txt file alongside .wav file
                 txt_path = corpus_path / f"{file_id}.txt"
-                if not txt_path.exists():
-                    with open(txt_path, 'w', encoding='utf-8') as txt_f:
-                        txt_f.write(transcription)
-                    txt_created += 1
+                # Always overwrite to ensure normalization is applied
+                with open(txt_path, 'w', encoding='utf-8') as txt_f:
+                    txt_f.write(normalized_text)
+                txt_created += 1
 
     logger.info(f"✓ Created {txt_created} transcription .txt files")
-    logger.info(f"✓ MFA can now align audio with transcriptions")
+    logger.info(f"✓ Normalized {txt_normalized} files (numbers → words)")
+    logger.info(f"✓ MFA and g2p_en will now process the same text")
 
     try:
         # Step 2: Custom dictionary (legacy - not needed with g2p_en)

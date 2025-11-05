@@ -19,6 +19,7 @@ wandb>=0.16.0  # Weights & Biases for experiment tracking (optional)
 g2p_en>=2.1.0      # ARPA phoneme converter (matches MFA alignments)
 nltk>=3.8.0        # Required by g2p_en
 textgrid>=1.5.0    # For parsing MFA alignment files
+inflect>=6.0.0     # Text normalization (numbers to words) for MFA compatibility
 
 # Important: Uninstall spacy-curated-transformers if present
 # It conflicts with transformers library needed by Misaki

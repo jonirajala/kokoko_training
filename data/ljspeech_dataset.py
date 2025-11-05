@@ -213,7 +213,8 @@ class LJSpeechDataset(Dataset):
         # Validate length matches phonemes (approximately)
         # Now using ARPA (g2p_en) which matches MFA's ARPA perfectly!
         # Tolerance set to 25% to handle differences in word pronunciations
-        # (g2p_en vs MFA dictionary may differ for some words)
+        # (g2p_en vs MFA dictionary may differ slightly for some words)
+        # Text normalization (numbers → words) ensures both see the same input
         mismatch_pct = abs(len(durations_frames) - phoneme_count) / phoneme_count if phoneme_count > 0 else 1.0
 
         if mismatch_pct > 0.25:
