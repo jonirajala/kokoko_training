@@ -1,0 +1,19 @@
+{
+  "vocab_size": 96,
+  "mel_dim": 80,
+  "hidden_dim": 512,
+  "n_encoder_layers": 6,
+  "n_heads": 8,
+  "encoder_ff_dim": 2048,
+  "encoder_dropout": 0.1,
+  "n_decoder_layers": 6,
+  "decoder_ff_dim": 2048,
+  "max_decoder_seq_len": 4000,
+  "sample_rate": 22050,
+  "hop_length": 256,
+  "win_length": 1024,
+  "n_fft": 1024,
+  "n_mels": 80,
+  "f_min": 0.0,
+  "f_max": 8000.0
+}

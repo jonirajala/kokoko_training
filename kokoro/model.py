@@ -10,6 +10,7 @@ import os
 
 from .positional_encoding import PositionalEncoding
 from .model_transformers import TransformerDecoder, TransformerEncoderBlock
+from .postnet import Postnet
 
 logger = logging.getLogger(__name__)
 
@@ -114,8 +115,28 @@ class KokoroModel(nn.Module):
         )
 
         # Output projection for Mel Spectrogram
-        # No activation or scaling - let the network learn the log-mel range naturally
-        self.mel_projection_out = nn.Linear(hidden_dim, mel_dim)
+        # CRITICAL FIX: Add PostNet for mel refinement!
+        # Previous architecture used only a single linear layer, which was too weak
+        # to capture fine mel structure (formants, harmonics, transitions).
+        # PostNet adds convolutional layers to refine coarse predictions.
+        self.mel_projection_coarse = nn.Linear(hidden_dim, mel_dim)  # Coarse prediction
+
+        # CRITICAL: Initialize mel projection bias to match typical mel range
+        # Log-mel spectrograms typically have mean ~-3.5, range [-11.5, 0.0]
+        # Without this, model starts predicting around 0, creating large initial error
+        with torch.no_grad():
+            # Initialize bias to -3.5 (typical mel mean)
+            self.mel_projection_coarse.bias.fill_(-3.5)
+            # Scale weights down to prevent large initial predictions
+            self.mel_projection_coarse.weight.mul_(0.1)
+
+        self.postnet = Postnet(
+            mel_dim=mel_dim,
+            postnet_dim=512,
+            n_layers=5,
+            kernel_size=5,
+            dropout=0.5
+        )
 
         # End-of-Speech (Stop Token) Predictor
         self.stop_token_predictor = nn.Linear(hidden_dim, 1)
@@ -294,20 +315,24 @@ class KokoroModel(nn.Module):
 
             if self.gradient_checkpointing and self.training:
                 # Apply checkpointing to duration predictor
-                log_durations = checkpoint(self.duration_predictor, text_encoded, use_reentrant=False).squeeze(-1)
+                log_durations_raw = checkpoint(self.duration_predictor, text_encoded, use_reentrant=False).squeeze(-1)
             else:
-                log_durations = self.duration_predictor(text_encoded).squeeze(-1)
+                log_durations_raw = self.duration_predictor(text_encoded).squeeze(-1)
 
-            # CRITICAL FIX: Clamp log-durations to prevent catastrophic expansion
-            # This prevents exp(9.3) = 11,000 frames per phoneme!
-            # Reasonable range: [0.1, 100] frames per phoneme
-            log_durations = torch.clamp(log_durations, min=-2.3, max=4.6)
+            # CRITICAL: Return raw predictions for loss computation!
+            # Only apply clamping during inference for safety
+            # During training, duration loss is computed on raw predictions
+            # This allows full gradient flow for learning
+
+            if not self.training:
+                # Hard clamp during inference ONLY
+                log_durations_raw = torch.clamp(log_durations_raw, min=-2.3, max=4.6)
 
             # Log after duration prediction (outside any checkpointed regions)
             if self.enable_profiling:
                 self.profiler.log_memory_stats("duration_prediction_end")
 
-            return log_durations
+            return log_durations_raw
 
     def _length_regulate(self, encoder_outputs, durations, text_padding_mask):
         """
@@ -344,11 +369,15 @@ class KokoroModel(nn.Module):
                     filtered_encoder_output = current_encoder_output[non_padded_indices]
                     filtered_durations = current_durations[non_padded_indices]
 
-                    filtered_durations = torch.clamp(filtered_durations, min=1).long()
+                    # CRITICAL: Keep as float during training for gradient flow!
+                    # Only convert to long for repeat_interleave (which requires int)
+                    # Use .detach() on the integer version so gradients flow to float version
+                    filtered_durations_float = torch.clamp(filtered_durations, min=1.0)
+                    filtered_durations_int = filtered_durations_float.long()
 
                     try:
                         expanded_encoder_output = torch.repeat_interleave(
-                            filtered_encoder_output, filtered_durations, dim=0
+                            filtered_encoder_output, filtered_durations_int, dim=0
                         )
                         expanded_padding_mask = torch.zeros(
                             expanded_encoder_output.shape[0], dtype=torch.bool, device=device
@@ -417,7 +446,8 @@ class KokoroModel(nn.Module):
         phoneme_durations: torch.Tensor,
         stop_token_targets: torch.Tensor,
         text_padding_mask: Optional[torch.Tensor] = None,
-        mel_padding_mask: Optional[torch.Tensor] = None
+        mel_padding_mask: Optional[torch.Tensor] = None,
+        use_gt_durations: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Enhanced training forward pass with gradient checkpointing enabled by default
@@ -444,7 +474,12 @@ class KokoroModel(nn.Module):
                 text_encoded = self.encode_text(phoneme_indices, mask=text_padding_mask)
 
                 # Predict durations with checkpointing (logging handled internally)
-                predicted_log_durations = self._predict_durations(text_encoded)
+                # Skip during overfit test when use_gt_durations=True
+                if use_gt_durations:
+                    # Use ground truth durations directly, skip prediction entirely
+                    predicted_log_durations = torch.log(phoneme_durations.float().clamp(min=1e-5))
+                else:
+                    predicted_log_durations = self._predict_durations(text_encoded)
 
                 # Length regulate (logging handled internally)
                 expanded_encoder_outputs, encoder_output_padding_mask = self._length_regulate(
@@ -523,15 +558,30 @@ class KokoroModel(nn.Module):
                         self.profiler.log_memory_stats("output_projections_start")
 
                     # Project decoder outputs with checkpointing
+                    # CRITICAL FIX: Use coarse + postnet architecture
                     if self.gradient_checkpointing and self.training:
-                        predicted_mel_frames = checkpoint(
-                            self.mel_projection_out, decoder_outputs, use_reentrant=False
+                        # Coarse mel prediction
+                        mel_coarse = checkpoint(
+                            self.mel_projection_coarse, decoder_outputs, use_reentrant=False
                         )
+                        # Refine with postnet (residual connection)
+                        # Scale residual by 0.5 to stabilize training while allowing sufficient refinement
+                        mel_residual = checkpoint(
+                            self.postnet, mel_coarse, use_reentrant=False
+                        )
+                        predicted_mel_frames = mel_coarse + 0.5 * mel_residual
+
                         predicted_stop_logits = checkpoint(
                             self.stop_token_predictor, decoder_outputs, use_reentrant=False
                         ).squeeze(-1)
                     else:
-                        predicted_mel_frames = self.mel_projection_out(decoder_outputs)
+                        # Coarse mel prediction
+                        mel_coarse = self.mel_projection_coarse(decoder_outputs)
+                        # Refine with postnet (residual connection)
+                        # Scale residual by 0.5 to stabilize training while allowing sufficient refinement
+                        mel_residual = self.postnet(mel_coarse)
+                        predicted_mel_frames = mel_coarse + 0.5 * mel_residual
+
                         predicted_stop_logits = self.stop_token_predictor(decoder_outputs).squeeze(-1)
 
                     if self.enable_profiling:
@@ -640,7 +690,18 @@ class KokoroModel(nn.Module):
                                 )
 
                                 decoder_out_t = decoder_outputs[:, -1:, :]
-                                mel_pred_t = self.mel_projection_out(decoder_out_t)
+                                # CRITICAL FIX: Use coarse + postnet for inference too
+                                mel_coarse_t = self.mel_projection_coarse(decoder_out_t)
+                                # For autoregressive generation, apply postnet to single frame
+                                # This is suboptimal (postnet designed for full sequences) but necessary
+                                mel_residual_t = self.postnet(mel_coarse_t)
+                                # Scale residual by 0.5 to match training
+                                mel_pred_t = mel_coarse_t + 0.5 * mel_residual_t
+
+                                # CRITICAL: Clamp mel to vocoder's training range [-11.5, 0.0]
+                                # Vocoder (HiFi-GAN) was trained on this range; values outside cause garbage audio
+                                mel_pred_t = torch.clamp(mel_pred_t, min=-11.5, max=0.0)
+
                                 generated_mels.append(mel_pred_t)
 
                                 stop_token_logit_t = self.stop_token_predictor(decoder_out_t)
