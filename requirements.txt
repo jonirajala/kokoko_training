@@ -16,7 +16,8 @@ tqdm>=4.64.0
 wandb>=0.16.0  # Weights & Biases for experiment tracking (optional)
 
 # G2P and phoneme processing (for English training)
-misaki[en]>=0.1.0  # Misaki G2P for Kokoro
+g2p_en>=2.1.0      # ARPA phoneme converter (matches MFA alignments)
+nltk>=3.8.0        # Required by g2p_en
 textgrid>=1.5.0    # For parsing MFA alignment files
 
 # Important: Uninstall spacy-curated-transformers if present
@@ -35,8 +36,6 @@ pillow
 absl-py>=0.4
 
 torchcodec
-
-misaki[en]
 
 typing-extensions
 

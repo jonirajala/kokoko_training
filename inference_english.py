@@ -214,9 +214,14 @@ class KokoroEnglishTTS:
         logger.info(f"Model '{model_path.name}' loaded successfully with vocab_size={vocab_size}.")
         return model
 
-    def text_to_speech(self, text: str, output_path: Optional[str] = None) -> torch.Tensor:
+    def text_to_speech(self, text: str, output_path: Optional[str] = None, debug: bool = False) -> torch.Tensor:
         """
         Convert English text to speech using the trained model.
+
+        Args:
+            text: Input text to convert
+            output_path: Optional path to save audio
+            debug: Enable detailed debugging output
         """
         if not text:
             logger.warning("Received empty text for conversion. Returning empty audio.")
@@ -226,6 +231,10 @@ class KokoroEnglishTTS:
 
         try:
             # Step 1: Process text into phoneme sequence
+            logger.info("=" * 60)
+            logger.info("STEP 1: Text to Phonemes")
+            logger.info("=" * 60)
+
             raw_processor_output = self.phoneme_processor.process_text(text)
             phoneme_sequence = PhonemeProcessorUtils.flatten_phoneme_output(raw_processor_output)
 
@@ -233,18 +242,43 @@ class KokoroEnglishTTS:
                 logger.error(f"Phoneme processor produced no phonemes for text: '{text}'. Conversion aborted.")
                 raise ValueError("No phonemes generated from the input text.")
 
+            logger.info(f"✓ Generated {len(phoneme_sequence)} phonemes")
             logger.info(f"Phonemes: {' '.join(phoneme_sequence)}")
 
+            if debug:
+                logger.info(f"Raw processor output structure: {type(raw_processor_output)}")
+                logger.info(f"Phoneme sequence (full): {phoneme_sequence}")
+
             # Step 2: Convert phonemes to numerical indices
+            logger.info("=" * 60)
+            logger.info("STEP 2: Phonemes to Indices")
+            logger.info("=" * 60)
+
             phoneme_indices = PhonemeProcessorUtils.phonemes_to_indices(
                 phoneme_sequence, self.phoneme_processor.phoneme_to_id
             )
-            logger.debug(f"Phoneme indices (first 20): {phoneme_indices[:20]}...")
+            logger.info(f"✓ Converted to {len(phoneme_indices)} indices")
+            logger.info(f"Index range: [{min(phoneme_indices)}, {max(phoneme_indices)}]")
+            logger.info(f"Vocab size: {len(self.phoneme_processor.phoneme_to_id)}")
+
+            if debug:
+                logger.info(f"Phoneme indices (full): {phoneme_indices}")
+                # Check for unknown phonemes (index 1 = <unk>)
+                unk_count = phoneme_indices.count(1)
+                if unk_count > 0:
+                    logger.warning(f"⚠ Found {unk_count} unknown phonemes (<unk>)!")
 
             # Convert to tensor and add batch dimension
             phoneme_tensor = torch.tensor(phoneme_indices, dtype=torch.long).unsqueeze(0).to(self.device)
+            logger.info(f"Phoneme tensor shape: {phoneme_tensor.shape}")
 
             # Step 3: Generate mel spectrogram
+            logger.info("=" * 60)
+            logger.info("STEP 3: Model Inference (Phonemes → Mel)")
+            logger.info("=" * 60)
+            logger.info(f"Max length: 400 frames")
+            logger.info(f"Stop threshold: 0.01")
+
             with torch.no_grad():
                 mel_spec = self.model.forward_inference(
                     phoneme_indices=phoneme_tensor,
@@ -256,21 +290,65 @@ class KokoroEnglishTTS:
             # Remove batch dimension and move to CPU for vocoder
             mel_spec = mel_spec.squeeze(0).cpu()
 
+            logger.info(f"✓ Generated mel spectrogram")
+            logger.info(f"Mel shape: {mel_spec.shape} (channels={mel_spec.shape[0]}, frames={mel_spec.shape[1]})")
+            logger.info(f"Mel range: [{mel_spec.min().item():.3f}, {mel_spec.max().item():.3f}]")
+            logger.info(f"Mel mean: {mel_spec.mean().item():.3f}, std: {mel_spec.std().item():.3f}")
+
+            # Check for problematic mel values
+            if debug:
+                if torch.isnan(mel_spec).any():
+                    logger.error("❌ CRITICAL: Mel spectrogram contains NaN values!")
+                if torch.isinf(mel_spec).any():
+                    logger.error("❌ CRITICAL: Mel spectrogram contains Inf values!")
+                if mel_spec.max() > 5.0 or mel_spec.min() < -15.0:
+                    logger.warning(f"⚠ WARNING: Mel range unusual! Expected [-11.5, 0.0], got [{mel_spec.min().item():.3f}, {mel_spec.max().item():.3f}]")
+
+                # Check if mel is all zeros or constant
+                if mel_spec.std() < 0.01:
+                    logger.error(f"❌ CRITICAL: Mel spectrogram is nearly constant (std={mel_spec.std().item():.6f})! This will produce garbage audio.")
+
             # Step 4: Convert mel spectrogram to audio using the neural vocoder
+            logger.info("=" * 60)
+            logger.info("STEP 4: Vocoder (Mel → Audio)")
+            logger.info("=" * 60)
+            logger.info(f"Vocoder type: {self.vocoder_manager.vocoder_type}")
+
             audio = self.vocoder_manager.mel_to_audio(mel_spec)
+
+            logger.info(f"✓ Generated audio")
+            logger.info(f"Audio shape: {audio.shape}")
+            logger.info(f"Audio duration: {len(audio) / self.sample_rate:.2f}s")
+            logger.info(f"Audio range: [{audio.min():.3f}, {audio.max():.3f}]")
+
+            if debug:
+                if torch.isnan(audio).any():
+                    logger.error("❌ CRITICAL: Audio contains NaN values!")
+                if torch.isinf(audio).any():
+                    logger.error("❌ CRITICAL: Audio contains Inf values!")
+                if audio.abs().max() < 0.001:
+                    logger.warning("⚠ WARNING: Audio amplitude very low (< 0.001)! May be silent.")
+                if audio.std() < 0.001:
+                    logger.warning("⚠ WARNING: Audio has very low variance (std < 0.001)! Likely garbage.")
 
             # Save audio if an output path is provided
             if output_path:
                 self.audio_utils.save_audio(audio, output_path)
-                logger.info(f"Audio saved to: {output_path}")
+                logger.info(f"✓ Audio saved to: {output_path}")
+
+            logger.info("=" * 60)
+            logger.info("INFERENCE COMPLETE")
+            logger.info("=" * 60)
 
             return audio
 
         except Exception as e:
-            logger.error(f"Error in text_to_speech: {e}")
+            logger.error(f"❌ Error in text_to_speech: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             raise
 
-    def batch_text_to_speech(self, texts: List[str], output_dir: str):
+    def batch_text_to_speech(self, texts: List[str], output_dir: str, debug: bool = False):
         """Converts multiple texts to speech, saving each to the specified output directory."""
         output_dir_path = Path(output_dir)
         output_dir_path.mkdir(parents=True, exist_ok=True)
@@ -278,7 +356,7 @@ class KokoroEnglishTTS:
         for i, text in enumerate(texts):
             output_path = output_dir_path / f"output_{i:03d}.wav"
             try:
-                self.text_to_speech(text, str(output_path))
+                self.text_to_speech(text, str(output_path), debug=debug)
                 logger.info(f"Successfully converted text {i+1} to {output_path}")
             except Exception as e:
                 logger.error(f"Failed to convert text '{text}' (item {i+1}): {e}")
@@ -360,6 +438,12 @@ Examples:
         help='Path to a custom HiFi-GAN vocoder model checkpoint (.pt or .pth) if not using the default or if a specific one is required.'
     )
 
+    parser.add_argument(
+        '--debug',
+        action='store_true',
+        help='Enable detailed debugging output showing mel statistics, phoneme analysis, etc.'
+    )
+
     return parser.parse_args()
 
 def main():
@@ -391,7 +475,7 @@ def main():
 
                 # Generate a unique output filename for interactive mode
                 output_path_interactive = f"interactive_output_{abs(hash(text_input)) % 10000}.wav"
-                tts.text_to_speech(text_input, output_path_interactive)
+                tts.text_to_speech(text_input, output_path_interactive, debug=args.debug)
                 print(f"Audio saved to: {output_path_interactive}")
 
             except KeyboardInterrupt:
@@ -407,7 +491,7 @@ def main():
     elif args.text:
         # Single text conversion
         try:
-            tts.text_to_speech(args.text, args.output)
+            tts.text_to_speech(args.text, args.output, debug=args.debug)
             logger.info(f"Successfully converted text to {args.output}")
         except ValueError as ve:
             logger.error(f"Error converting text '{args.text}': {ve}")
@@ -431,7 +515,7 @@ def main():
                 output_dir_for_batch = Path("./batch_outputs") # Default to a directory if not specified properly
                 logger.info(f"Output for batch text will be saved to '{output_dir_for_batch}'")
 
-            tts.batch_text_to_speech(texts_from_file, str(output_dir_for_batch))
+            tts.batch_text_to_speech(texts_from_file, str(output_dir_for_batch), debug=args.debug)
             logger.info(f"Batch conversion complete. Audio files saved to {output_dir_for_batch}")
 
         except FileNotFoundError:

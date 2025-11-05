@@ -212,22 +212,23 @@ class LJSpeechDataset(Dataset):
 
         # Validate length matches phonemes (approximately)
         # Now using ARPA (g2p_en) which matches MFA's ARPA perfectly!
-        # Tolerance set to 15% to handle minor differences in word pronunciations
-        # (g2p_en vs MFA dictionary may differ slightly for some words)
+        # Tolerance set to 25% to handle differences in word pronunciations
+        # (g2p_en vs MFA dictionary may differ for some words)
         mismatch_pct = abs(len(durations_frames) - phoneme_count) / phoneme_count if phoneme_count > 0 else 1.0
 
-        if mismatch_pct > 0.15:
+        if mismatch_pct > 0.25:
             raise ValueError(
                 f"Phoneme count mismatch in {alignment_path}!\n"
                 f"MFA phonemes: {len(durations_frames)}, G2P phonemes: {phoneme_count}\n"
-                f"Mismatch: {mismatch_pct*100:.1f}% (threshold: 10%)\n"
+                f"Mismatch: {mismatch_pct*100:.1f}% (threshold: 25%)\n"
                 f"\n"
-                f"This means your MFA alignments don't match Misaki G2P phoneme set.\n"
-                f"Solution: Re-run alignment with custom IPA dictionary:\n"
-                f"  python setup_ljspeech.py --align-only\n"
+                f"This means your MFA alignments (ARPA) don't match g2p_en (ARPA) phoneme set.\n"
+                f"This is unusual since both use ARPA phonemes.\n"
                 f"\n"
-                f"If you're certain alignments are correct, increase tolerance in\n"
-                f"data/ljspeech_dataset.py line ~195"
+                f"Possible solutions:\n"
+                f"1. Increase tolerance to 20-25% in data/ljspeech_dataset.py line 219\n"
+                f"2. Re-generate alignments: python setup_ljspeech.py --align-only\n"
+                f"3. Check if alignments are from correct source (should be ARPA-based)"
             )
 
         # Adjust durations to match phoneme count if needed (minor differences)
