@@ -28,19 +28,25 @@ Full encoder-decoder transformer with multi-head attention, phoneme-level durati
 Install dependencies:
 ```bash
 pip install -r requirements.txt
-pip install "misaki[en]"
 ```
 
-Download LJSpeech dataset with pre-aligned MFA annotations (3.8GB, recommended):
+The system uses `g2p_en` for grapheme-to-phoneme conversion (ARPA phonemes), which perfectly matches MFA's english_us_arpa alignment model.
+
+Download LJSpeech dataset with pre-aligned MFA annotations (3.8GB, **recommended - saves 1-3 hours**):
 ```bash
 python setup_ljspeech.py --zenodo
 ```
 
-Or download and align yourself (2.6GB + 1-3 hours):
+Or download and align yourself using MFA (2.6GB + 1-3 hours alignment time):
 ```bash
+# Download dataset only
 python setup_ljspeech.py
-python setup_ljspeech.py --align
+
+# Then run alignment with standard dictionary (matches g2p_en)
+python setup_ljspeech.py --align --no-custom-dict
 ```
+
+**Note**: The `--no-custom-dict` flag uses MFA's standard `english_us_arpa` dictionary, which perfectly matches our `g2p_en` phoneme processor. This ensures 100% alignment compatibility.
 
 Start training:
 ```bash
@@ -286,7 +292,7 @@ kokoro-english-tts/
 ├── data/                            # Dataset and preprocessing
 │   ├── __init__.py
 │   ├── ljspeech_dataset.py          # LJSpeech data loader
-│   └── english_phoneme_processor.py # English G2P (Misaki)
+│   └── english_phoneme_processor.py # English G2P (g2p_en - ARPA)
 │
 ├── audio/                           # Audio processing and vocoder
 │   ├── __init__.py
@@ -310,7 +316,7 @@ kokoro-english-tts/
 
 - Python 3.11 (atleast tested with this)
 - PyTorch 2.0+ (CUDA 11.8+ for GPU)
-- misaki[en] - English G2P
+- g2p_en - English G2P (ARPA phonemes matching MFA)
 - librosa, soundfile - Audio processing
 - wandb - Experiment tracking (optional)
 - tqdm - Progress bars
@@ -339,4 +345,4 @@ This implementation is for educational and research purposes.
 
 ## Acknowledgments
 
-Based on the original Kokoro TTS model. LJSpeech dataset by Keith Ito. Montreal Forced Aligner for phoneme-level alignments. Misaki for English G2P. Original implementation based on [kokoro-ruslan](https://github.com/igorshmukler/kokoro-ruslan).
+Based on the original Kokoro TTS model. LJSpeech dataset by Keith Ito. Montreal Forced Aligner for phoneme-level alignments. g2p_en for English grapheme-to-phoneme conversion (ARPA phonemes). Original implementation based on [kokoro-ruslan](https://github.com/igorshmukler/kokoro-ruslan).

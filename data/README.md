@@ -6,7 +6,7 @@ Dataset loading and phoneme processing for English TTS.
 
 `ljspeech_dataset.py` loads and processes the LJSpeech dataset (13,100 English speech samples) with MFA alignments. Includes `LJSpeechDataset` for data loading, `LengthBasedBatchSampler` for smart batching by sequence length, and `collate_fn` for batch padding. Reads MFA TextGrid alignments for duration, converts audio to mel spectrograms, handles variable-length sequences. Batching by length reduces padding by ~30-40%.
 
-`english_phoneme_processor.py` converts English text to phonemes using Misaki. Vocabulary of 63 phonemes (IPA + special tokens): vowels (ə, ɪ, ɛ, æ, ʌ, ɔ, ʊ, i, u), consonants (p, b, t, d, k, g, f, v, s, z), special tokens (SIL for silence, SPN for spoken noise), and stress markers (ˈ primary, ˌ secondary). Has fallback mode if Misaki not installed.
+`english_phoneme_processor.py` converts English text to phonemes using g2p_en (ARPA phonemes). Uses ARPA phoneme set which perfectly matches MFA's english_us_arpa alignment model, ensuring 100% alignment compatibility. Vocabulary includes vowels (AA, AE, AH, AO, AW, AY, EH, ER, EY, IH, IY, OW, OY, UH, UW), consonants (B, CH, D, DH, F, G, HH, JH, K, L, M, N, NG, P, R, S, SH, T, TH, V, W, Y, Z, ZH), and special tokens (SIL for silence, SPN for spoken noise). Stress markers (0, 1, 2) are included with vowels (e.g., AA0, AA1, AA2).
 
 ## Dataset Format
 
@@ -26,7 +26,7 @@ TextGrid files contain phoneme-level alignments with start/end times. Used to ex
 
 ## Processing Pipeline
 
-Training sample creation: load audio WAV (22050 Hz), compute 80-channel mel spectrogram, get transcription from metadata.csv, convert text to phonemes via Misaki, extract durations from TextGrid (or uniform), generate stop token targets (1 at end).
+Training sample creation: load audio WAV (22050 Hz), compute 80-channel mel spectrogram, get transcription from metadata.csv, convert text to phonemes via g2p_en (ARPA), extract durations from TextGrid (or uniform), generate stop token targets (1 at end).
 
 ## Usage
 
