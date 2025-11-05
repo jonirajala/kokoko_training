@@ -171,21 +171,10 @@ def test_overfit():
     # NO custom initialization - use model defaults!
     logger.info("Using default model initialization (no custom duration predictor init)")
 
-    # CRITICAL FIX: Freeze duration predictor to focus on mel learning
-    # Duration predictor gradients (100+) are 100,000x larger than decoder (0.001)
-    # This completely dominates training. Since we use ground truth durations anyway,
-    # we can freeze it and focus only on mel prediction for overfit test.
-    logger.info("\nFreezing duration predictor to focus gradient flow on mel prediction...")
-    for param in model.duration_predictor.parameters():
-        param.requires_grad = False
-
-    # Verify it's actually frozen
-    duration_frozen_count = sum(1 for p in model.duration_predictor.parameters() if not p.requires_grad)
-    duration_total_count = sum(1 for p in model.duration_predictor.parameters())
-    logger.info(f"Duration predictor frozen: {duration_frozen_count}/{duration_total_count} parameters ✓")
-
-    # Also verify we're using use_gt_durations flag
-    logger.info("Will use use_gt_durations=True to bypass duration predictor forward pass ✓")
+    # Duration predictor: Keep it trainable for inference to work
+    # We'll use very low loss weight to prevent it from dominating
+    logger.info("\nDuration predictor: TRAINABLE (needed for inference)")
+    logger.info("Using low duration loss weight to prevent gradient domination")
 
     # Optimizer - Use conservative learning rate for stability
     # High LR (3e-3) causes gradient explosion (294!) and divergence
@@ -240,15 +229,14 @@ def test_overfit():
     logger.info(f"  Durations: {durations.shape}")
     logger.info(f"  Stop tokens: {stop_tokens.shape}")
 
-    # Loss weights for overfit test - using ground truth durations (teacher forcing)
-    # Focus entirely on mel prediction
-    # REDUCED mel weight from 5.0 to 1.0 - high weight was causing gradient explosion (294!)
+    # Loss weights for overfit test
+    # Balance mel and duration to train both (needed for inference)
     mel_loss_weight = 1.0  # Standard weight
-    duration_loss_weight = 0.0  # Zero - we're using ground truth durations
+    duration_loss_weight = 0.01  # Very small - just enough to train duration predictor
     stop_token_loss_weight = 0.1  # Small weight
 
     logger.info(f"Loss weights: mel={mel_loss_weight}, duration={duration_loss_weight}, stop={stop_token_loss_weight}")
-    logger.info("Using teacher-forced durations (ground truth) - duration predictor bypassed")
+    logger.info("Using teacher-forced mel (ground truth as decoder input) + training duration predictor")
 
     # Training loop
     logger.info("\n" + "="*70)
@@ -276,7 +264,8 @@ def test_overfit():
         optimizer.zero_grad(set_to_none=True)
 
         # Forward pass with mixed precision (match real training!)
-        # CRITICAL: use_gt_durations=True bypasses duration predictor entirely
+        # Use ground truth durations for length regulation (teacher forcing for decoder)
+        # But allow duration predictor to train so inference works
         if use_mixed_precision:
             with torch.amp.autocast("cuda", dtype=autocast_dtype):
                 mel_pred, dur_pred, stop_pred = model.forward_training(
@@ -286,7 +275,7 @@ def test_overfit():
                     stop_token_targets=stop_tokens,
                     text_padding_mask=None,
                     mel_padding_mask=None,
-                    use_gt_durations=True  # Skip duration predictor, use teacher forcing
+                    use_gt_durations=False  # Train duration predictor for inference
                 )
         else:
             mel_pred, dur_pred, stop_pred = model.forward_training(
@@ -296,16 +285,15 @@ def test_overfit():
                 stop_token_targets=stop_tokens,
                 text_padding_mask=None,
                 mel_padding_mask=None,
-                use_gt_durations=True  # Skip duration predictor, use teacher forcing
+                use_gt_durations=False  # Train duration predictor for inference
             )
 
         # Compute losses
-        # CRITICAL: Don't cast to float() - it breaks gradient chain in mixed precision!
-        # Compute loss in the same dtype as predictions, then it will auto-upcast to FP32 for backward
         mel_loss = nn.L1Loss(reduction='mean')(mel_pred, mel_spec)
 
-        # Duration loss is zero (we're using ground truth durations)
-        dur_loss = torch.zeros((), device=mel_spec.device)
+        # Duration loss (log space) - very small weight to train duration predictor
+        dur_target_log = torch.log(durations.float().clamp(min=1e-5))
+        dur_loss = nn.MSELoss(reduction='mean')(dur_pred, dur_target_log)
 
         # Stop token loss
         stop_loss = nn.BCEWithLogitsLoss()(stop_pred.squeeze(-1), stop_tokens)
