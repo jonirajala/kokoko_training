@@ -230,6 +230,8 @@ def run_mfa_alignment(dataset_path: str, use_custom_dict: bool = False):
     logger.info("\nRunning Montreal Forced Aligner...")
 
     dataset_path = Path(dataset_path)
+    # MFA needs to point to the directory containing .wav and .txt files
+    corpus_path = dataset_path / "wavs"
     output_path = dataset_path / "TextGrid" / "wavs"
 
     if output_path.exists():
@@ -280,7 +282,7 @@ def run_mfa_alignment(dataset_path: str, use_custom_dict: bool = False):
         logger.info("Step 3/4: Running forced alignment")
         logger.info("="*70)
 
-        logger.info(f"Input corpus: {dataset_path}")
+        logger.info(f"Input corpus: {corpus_path}")
         logger.info(f"Output: {output_path}")
 
         logger.info("Using standard english_us_arpa dictionary")
@@ -292,7 +294,7 @@ def run_mfa_alignment(dataset_path: str, use_custom_dict: bool = False):
         subprocess.run(
             [
                 "mfa", "align",
-                str(dataset_path),
+                str(corpus_path),   # Point to wavs/ directory with .wav and .txt files
                 dictionary,         # custom or standard dictionary
                 "english_us_arpa",  # acoustic model
                 str(output_path),   # output directory (wavs subfolder)
