@@ -303,6 +303,7 @@ class EnglishTrainer:
         mel_loss_epoch = 0.0
         dur_loss_epoch = 0.0
         stop_loss_epoch = 0.0
+        skipped_batches = 0  # Track NaN/padding batches
 
         num_batches = len(self.dataloader)
 
@@ -422,6 +423,7 @@ class EnglishTrainer:
                         if not torch.isfinite(grad_norm):
                             logger.warning(f"[Batch {batch_idx}] Non-finite grad norm ({grad_norm:.2f}). Skipping batch.")
                             self.optimizer.zero_grad(set_to_none=True)
+                            skipped_batches += 1
                             continue
 
                         self.optimizer.step()
@@ -435,6 +437,7 @@ class EnglishTrainer:
                         if not torch.isfinite(grad_norm):
                             logger.warning(f"[Batch {batch_idx}] Non-finite grad norm ({grad_norm:.2f}). Skipping batch.")
                             self.optimizer.zero_grad(set_to_none=True)
+                            skipped_batches += 1
                             self.scaler.update()
                             continue
 
@@ -561,7 +564,7 @@ class EnglishTrainer:
             self.profiler.__exit__(None, None, None)
             self.profiler = None
 
-        return avg_total_loss, avg_mel_loss, avg_dur_loss, avg_stop_loss
+        return avg_total_loss, avg_mel_loss, avg_dur_loss, avg_stop_loss, skipped_batches
 
     def train(self):
         """Main training function with mixed precision support and W&B logging"""
@@ -628,7 +631,7 @@ class EnglishTrainer:
                 self.profile_training_steps(self.config.profile_steps)
 
             for epoch in range(self.start_epoch, self.config.num_epochs):
-                avg_total_loss, avg_mel_loss, avg_dur_loss, avg_stop_loss = self.train_epoch(epoch)
+                avg_total_loss, avg_mel_loss, avg_dur_loss, avg_stop_loss, skipped_batches = self.train_epoch(epoch)
 
                 # Note: scheduler.step() is now called per batch, not per epoch
                 current_lr = self.optimizer.param_groups[0]['lr']
@@ -639,14 +642,11 @@ class EnglishTrainer:
                             f"Avg Stop Loss: {avg_stop_loss:.4f}, "
                             f"Current LR: {current_lr:.8f}")
 
-                # Log skipped samples if any
-                if hasattr(self.dataset, 'skipped_samples') and self.dataset.skipped_samples > 0:
-                    skipped = self.dataset.skipped_samples
-                    total = len(self.dataset)
-                    pct = (skipped / total) * 100
-                    logger.info(f"Skipped {skipped}/{total} samples ({pct:.1f}%) due to phoneme mismatches (OOV words, special chars)")
-                    # Reset counter for next epoch
-                    self.dataset.skipped_samples = 0
+                # Log skipped batches if any
+                if skipped_batches > 0:
+                    total_batches = len(self.dataloader)
+                    pct = (skipped_batches / total_batches) * 100
+                    logger.info(f"Skipped {skipped_batches}/{total_batches} batches ({pct:.1f}%) due to NaN gradients (phoneme mismatches, padding samples)")
 
                 # Log memory management stats for this epoch
                 if self.enable_adaptive_memory:
