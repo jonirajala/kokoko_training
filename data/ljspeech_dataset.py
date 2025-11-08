@@ -98,10 +98,17 @@ class LJSpeechDataset(Dataset):
         with open(metadata_file, 'r', encoding='utf-8') as f:
             for line in tqdm(f, total=total_lines, desc="Loading metadata"):
                 parts = line.strip().split('|')
-                if len(parts) >= 3:
+                if len(parts) >= 2:
                     audio_file_stem = parts[0]
-                    # Use normalized text (3rd column)
-                    normalized_text = parts[2]
+
+                    # Read normalized text from .txt file (created during MFA setup with number normalization)
+                    txt_path = self.data_dir / "wavs" / f"{audio_file_stem}.txt"
+                    if txt_path.exists():
+                        with open(txt_path, 'r', encoding='utf-8') as txt_f:
+                            normalized_text = txt_f.read().strip()
+                    else:
+                        # Fallback to metadata.csv if .txt doesn't exist
+                        normalized_text = parts[2] if len(parts) >= 3 else parts[1]
 
                     audio_path = self.data_dir / "wavs" / f"{audio_file_stem}.wav"
 
