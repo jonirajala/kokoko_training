@@ -19,7 +19,7 @@ class EnglishTrainingConfig:
     # Basic training parameters
     num_epochs: int = 100
     batch_size: int = 32        # Optimal for RTX 4090 with BF16
-    learning_rate: float = 7e-5 # Optimal for batch=32 + BF16 (balanced speed + stability)
+    learning_rate: float = 1e-4 # Increased from 7e-5 to escape local minima
     device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
     # Learning Rate Reasoning (batch=32, BF16):
