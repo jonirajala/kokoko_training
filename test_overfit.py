@@ -243,7 +243,7 @@ def test_overfit():
     logger.info("Using teacher-forced mel (ground truth as decoder input) + training duration predictor")
 
     # Training loop - extended for better convergence
-    num_iterations = 3000  # Increased from 3000 to get lower mel loss
+    num_iterations = 2000  # Increased from 3000 to get lower mel loss
     logger.info("\n" + "="*70)
     logger.info(f"Starting overfit training ({num_iterations} iterations)")
     logger.info("="*70 + "\n")

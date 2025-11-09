@@ -112,15 +112,16 @@ class EnglishTrainingConfig:
     # Scheduled Sampling (CRITICAL for inference quality)
     # Gradually exposes model to its own predictions during training to reduce exposure bias
     # Without this, model trains with perfect inputs but fails at inference with imperfect predictions
-    # DELAYED START: Wait until mel loss < 0.7 (epoch 10-15) before starting
+    # DELAYED START: Wait until mel loss < 0.5 (epoch 30-40) before starting
+    # IMPORTANT: Starting too early causes loss spikes when model predictions are still poor
     enable_scheduled_sampling: bool = True  # Enable scheduled sampling
-    scheduled_sampling_warmup_batches: int = 4000  # Pure teacher forcing for first N batches (~10 epochs)
-    scheduled_sampling_max_prob: float = 0.3      # Maximum sampling probability (reduced from 0.5)
-    scheduled_sampling_zero_input_ratio: float = 0.2  # 20% of sampling time uses zero input (reduced from 0.3)
-    # Schedule: 0-4000 batches: prob=0.0 (teacher forcing - let model learn basics)
-    #           4000-8000: prob=0.1 (gentle exposure)
-    #           8000-16000: prob=0.2 (building robustness)
-    #           16000+: prob=0.3 (moderate exposure)
+    scheduled_sampling_warmup_batches: int = 12000  # Pure teacher forcing for first N batches (~30 epochs)
+    scheduled_sampling_max_prob: float = 0.15      # Maximum sampling probability (conservative)
+    scheduled_sampling_zero_input_ratio: float = 0.1  # 10% of sampling time uses zero input
+    # Schedule: 0-12000 batches: prob=0.0 (teacher forcing - let model learn basics)
+    #           12000-16000: prob=0.05 (very gentle exposure)
+    #           16000-24000: prob=0.10 (gentle exposure)
+    #           24000+: prob=0.15 (moderate exposure)
 
     # Ground Truth Durations (IMPORTANT for early training stability)
     # Using GT durations bypasses duration predictor, allowing mel predictor to learn faster

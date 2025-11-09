@@ -37,23 +37,6 @@ Download LJSpeech dataset with pre-aligned MFA annotations (3.8GB, **recommended
 python setup_ljspeech.py --zenodo
 ```
 
-### Installing MFA
-wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
-bash Miniconda3-latest-Linux-x86_64.sh
-
-# Follow the prompts (accept license, choose install dir, etc.)
-# Then restart your shell to activate conda
-
-# 2. Create a new environment for MFA
-conda create -n mfa -c conda-forge montreal-forced-aligner
-
-# 3. Activate the environment
-conda activate mfa
-
-# 4. Verify installation
-mfa version
-
-
 ```bash
 # Download dataset only
 python setup_ljspeech.py
