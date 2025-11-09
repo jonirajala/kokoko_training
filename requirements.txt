@@ -36,7 +36,8 @@ werkzeug>=1.0.1
 pillow
 absl-py>=0.4
 
-torchcodec
+# torchcodec - REMOVED: requires FFmpeg, not needed for WAV files
+# torchaudio with soundfile backend is sufficient for LJSpeech
 
 typing-extensions
 

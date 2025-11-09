@@ -361,8 +361,12 @@ class LJSpeechDataset(Dataset):
         sample = self.samples[idx]
 
         try:
-            # Load audio using soundfile backend (avoids torchcodec dependency)
-            waveform, sr = torchaudio.load(sample['audio_path'], backend="soundfile")
+            # Load audio using soundfile directly (avoids torchcodec dependency)
+            import soundfile as sf
+            audio_data, sr = sf.read(sample['audio_path'])
+            # Convert to torch tensor and add channel dimension
+            waveform = torch.from_numpy(audio_data).float().unsqueeze(0)
+
             if sr != self.config.sample_rate:
                 resampler = torchaudio.transforms.Resample(sr, self.config.sample_rate)
                 waveform = resampler(waveform)
@@ -418,9 +422,7 @@ class LJSpeechDataset(Dataset):
             # Changed to DEBUG to avoid spamming logs during training
             # Most errors are phoneme mismatches due to OOV words (expected)
             self.skipped_samples += 1
-            logger.error(f"ERROR loading sample {sample['audio_file']}: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.debug(f"Skipping sample {sample['audio_file']}: {e}")
             # Return a dummy sample to avoid breaking the batch
             return {
                 'phoneme_indices': torch.tensor([0], dtype=torch.long),
