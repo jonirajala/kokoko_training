@@ -14,6 +14,9 @@ import random
 import numpy as np
 from tqdm import tqdm
 
+# Set torchaudio backend to avoid torchcodec dependency issues
+# Use soundfile backend which is more stable
+torchaudio.set_audio_backend("soundfile")
 
 logger = logging.getLogger(__name__)
 
@@ -412,7 +415,9 @@ class LJSpeechDataset(Dataset):
             # Changed to DEBUG to avoid spamming logs during training
             # Most errors are phoneme mismatches due to OOV words (expected)
             self.skipped_samples += 1
-            logger.debug(f"Skipping sample {sample['audio_file']}: {e}")
+            logger.error(f"ERROR loading sample {sample['audio_file']}: {e}")
+            import traceback
+            traceback.print_exc()
             # Return a dummy sample to avoid breaking the batch
             return {
                 'phoneme_indices': torch.tensor([0], dtype=torch.long),
