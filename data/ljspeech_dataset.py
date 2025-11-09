@@ -14,9 +14,12 @@ import random
 import numpy as np
 from tqdm import tqdm
 
-# Set torchaudio backend to avoid torchcodec dependency issues
-# Use soundfile backend which is more stable
-torchaudio.set_audio_backend("soundfile")
+# Use soundfile backend directly to avoid torchcodec dependency issues
+# Import soundfile_backend to force torchaudio to use it
+try:
+    import soundfile  # Ensure soundfile is available
+except ImportError:
+    raise ImportError("soundfile is required. Install with: pip install soundfile")
 
 logger = logging.getLogger(__name__)
 
@@ -358,8 +361,8 @@ class LJSpeechDataset(Dataset):
         sample = self.samples[idx]
 
         try:
-            # Load audio - TorchCodec handles this automatically
-            waveform, sr = torchaudio.load(sample['audio_path'])
+            # Load audio using soundfile backend (avoids torchcodec dependency)
+            waveform, sr = torchaudio.load(sample['audio_path'], backend="soundfile")
             if sr != self.config.sample_rate:
                 resampler = torchaudio.transforms.Resample(sr, self.config.sample_rate)
                 waveform = resampler(waveform)
