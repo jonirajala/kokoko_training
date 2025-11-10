@@ -44,7 +44,7 @@ dataloader = DataLoader(
 logger.info("\nInitializing model...")
 model = KokoroModel(
     vocab_size=96,
-    n_mels=config.n_mels,
+    mel_dim=config.n_mels,
     hidden_dim=config.hidden_dim,
     n_encoder_layers=config.n_encoder_layers,
     n_decoder_layers=config.n_decoder_layers,
