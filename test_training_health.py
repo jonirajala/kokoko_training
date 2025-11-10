@@ -80,19 +80,14 @@ with torch.no_grad():
         stop_token_targets = batch['stop_token_targets'].to(config.device)
 
         try:
-            # Forward pass
-            outputs = model(
+            # Forward pass (returns tuple: mel_output, duration_output, stop_output)
+            mel_output, duration_output, stop_token_output = model(
                 phoneme_indices=phoneme_indices,
-                phoneme_lengths=phoneme_lengths,
-                target_mel_specs=mel_specs,
-                target_mel_lengths=mel_lengths,
+                mel_specs=mel_specs,
                 phoneme_durations=phoneme_durations,
-                use_teacher_forcing=True
+                stop_token_targets=stop_token_targets,
+                use_gt_durations=True
             )
-
-            mel_output = outputs['mel_output']
-            duration_output = outputs['duration_output']
-            stop_token_output = outputs['stop_token_output']
 
             # Calculate losses per sample
             batch_size = mel_specs.size(0)

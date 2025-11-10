@@ -83,17 +83,17 @@ with torch.no_grad():
         phoneme_durations = batch['phoneme_durations'].to(config.device)
 
         try:
-            # Forward pass
-            outputs = model(
-                phoneme_indices=phoneme_indices,
-                phoneme_lengths=phoneme_lengths,
-                target_mel_specs=mel_specs,
-                target_mel_lengths=mel_lengths,
-                phoneme_durations=phoneme_durations,
-                use_teacher_forcing=True
-            )
+            # Get stop token targets
+            stop_token_targets = batch['stop_token_targets'].to(config.device)
 
-            mel_output = outputs['mel_output']
+            # Forward pass (returns tuple: mel_output, duration_output, stop_output)
+            mel_output, duration_output, stop_token_output = model(
+                phoneme_indices=phoneme_indices,
+                mel_specs=mel_specs,
+                phoneme_durations=phoneme_durations,
+                stop_token_targets=stop_token_targets,
+                use_gt_durations=True
+            )
 
             # Calculate per-sample mel loss
             batch_size = mel_specs.size(0)
