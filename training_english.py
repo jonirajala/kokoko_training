@@ -90,9 +90,9 @@ def parse_arguments():
     parser.add_argument(
         '--model-size',
         type=str,
-        choices=['small', 'default', 'large'],
+        choices=['small', 'medium', 'default', 'large'],
         default='default',
-        help='Model size configuration (default: default)'
+        help='Model size: small (6M), medium (25M, recommended for LJSpeech), default (62M), large (120M)'
     )
 
     # Device
@@ -176,8 +176,11 @@ def create_config_from_args(args) -> EnglishTrainingConfig:
     # Get base configuration based on model size
     if args.model_size == 'small':
         config = get_small_config()
+    elif args.model_size == 'medium':
+        from training.config_english import get_medium_config
+        config = get_medium_config()
     elif args.model_size == 'large':
-        from config_english import get_large_config
+        from training.config_english import get_large_config
         config = get_large_config()
     else:
         config = get_default_config()

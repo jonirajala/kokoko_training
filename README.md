@@ -69,15 +69,18 @@ python inference_english.py \
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--corpus` | `./LJSpeech-1.1` | Path to LJSpeech dataset |
+| `--corpus` | `LJSpeech-1.1` | Path to LJSpeech dataset |
 | `--output` | `./kokoro_english_model` | Output directory for checkpoints |
-| `--batch-size` | `8` | Training batch size |
-| `--epochs` | `100` | Number of training epochs |
-| `--learning-rate` | `1e-4` | Learning rate |
-| `--resume` | `None` | Resume from checkpoint (auto or path) |
+| `--batch-size` | from config (32) | Training batch size |
+| `--epochs` | from config (300) | Number of training epochs |
+| `--learning-rate` | from config (1e-3) | Learning rate |
+| `--model-size` | `default` | Model size: `small` (6M), `medium` (25M, **recommended for LJSpeech**), `default` (62M), `large` (120M) |
+| `--device` | `auto` | Device: `auto`, `cuda`, `mps`, `cpu` |
+| `--resume` | `None` | Resume from checkpoint (`auto` for latest, or path to .pth) |
 | `--wandb` | `False` | Enable Weights & Biases logging |
+| `--no-gradient-checkpointing` | `False` | Disable gradient checkpointing (uses more memory) |
 | `--no-mixed-precision` | `False` | Disable mixed precision training |
-| `--test-mode` | `False` | Quick test with 100 samples |
+| `--test-mode` | `False` | Quick test with 100 samples, 5 epochs |
 
 ## Model Architecture
 
