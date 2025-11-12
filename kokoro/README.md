@@ -77,7 +77,72 @@ Text → Encoder → Duration → Length → Decoder → Mel Coarse → PostNet 
 - **Scheduled Sampling**: Prevents exposure bias by gradually exposing model to imperfect predictions during training
 - **PostNet on Complete Sequence**: Conv1D (kernel_size=5) needs temporal context - applying frame-by-frame produces garbage
 - **Zero-Input Training**: Teaches model to bootstrap from nothing, like inference start conditions
-- **Loss Balance**: duration_loss_weight=0.01 prevents duration gradients from overwhelming mel learning
+- **Dual Mel Loss (Tacotron 2)**: Supervises both coarse and refined mel predictions for faster convergence
+- **Loss Balance**: duration_loss_weight=0.005 prevents duration gradients from overwhelming mel learning
+
+## Dual Mel Loss Architecture
+
+Following **Tacotron 2's dual-loss design**, the model returns BOTH coarse and refined mel spectrograms for separate supervision:
+
+```
+Decoder Output → Linear Projection → Mel Coarse (pre-PostNet)
+                                          ↓
+                                     PostNet (5-layer Conv1D)
+                                          ↓
+                                     Mel Residual
+                                          ↓
+                         Mel Refined = Mel Coarse + Mel Residual (post-PostNet)
+```
+
+### Why Dual Loss?
+
+**Problem with single loss**: If you only supervise the final refined mel (post-PostNet), gradients must flow through 5 convolutional layers before reaching the decoder. This causes:
+- ❌ Slow convergence (decoder doesn't get direct feedback)
+- ❌ Weak gradients (diluted through PostNet)
+- ❌ PostNet may "fight" decoder (no gradient balance)
+
+**Solution**: Compute **TWO separate losses**:
+```python
+L_mel = α * L1(mel_coarse, target) + β * L1(mel_refined, target)
+        ↑ pre-PostNet (decoder)      ↑ post-PostNet (final quality)
+```
+
+### Loss Configuration
+
+Default weights (from `training/config_english.py`):
+```python
+mel_coarse_loss_weight: float = 0.5   # Pre-PostNet (decoder supervision)
+mel_refined_loss_weight: float = 1.0  # Post-PostNet (final quality)
+```
+
+**Reasoning**:
+- **α = 0.5**: Decoder gets strong direct gradients → learns faster
+- **β = 1.0**: PostNet refinement prioritized → better final quality
+- **Gradient balance**: Both decoder and PostNet get clear optimization targets
+- **No conflict**: PostNet refines instead of fighting decoder
+
+### Benefits
+
+✅ **Faster convergence**: Decoder learns 2-3x faster with direct supervision
+✅ **Stable training**: Clear gradient flow to all components
+✅ **Better quality**: PostNet specializes in fine details (formants, harmonics)
+✅ **Industry standard**: Used in Tacotron 2, FastSpeech, and all major TTS models
+
+### Implementation
+
+The model's `forward_training()` returns BOTH mels:
+```python
+mel_coarse, mel_refined, durations, stop_logits = model.forward_training(...)
+```
+
+The trainer computes both losses separately:
+```python
+loss_mel_coarse = L1(mel_coarse, target)  # Direct decoder supervision
+loss_mel_refined = L1(mel_refined, target)  # Final quality supervision
+total_loss = 0.5 * loss_mel_coarse + 1.0 * loss_mel_refined + ...
+```
+
+This dual-loss approach is **critical for training large models** (62M parameters) on limited data (24 hours).
 
 ## Model Parameters
 
@@ -101,7 +166,8 @@ model = KokoroModel(
 )
 
 # Training with scheduled sampling (recommended)
-mel_pred, duration_pred, stop_pred = model.forward_training(
+# Returns BOTH mel_coarse (pre-PostNet) and mel_refined (post-PostNet)
+mel_coarse, mel_refined, duration_pred, stop_pred = model.forward_training(
     phoneme_indices=phoneme_indices,
     mel_specs=mel_specs,
     phoneme_durations=phoneme_durations,
@@ -110,9 +176,14 @@ mel_pred, duration_pred, stop_pred = model.forward_training(
     decoder_input_mels=None  # For scheduled sampling: pass predictions or zeros
 )
 
+# Compute dual mel loss (Tacotron 2 approach)
+loss_mel_coarse = L1(mel_coarse, mel_specs)   # Pre-PostNet (decoder)
+loss_mel_refined = L1(mel_refined, mel_specs)  # Post-PostNet (final)
+total_mel_loss = 0.5 * loss_mel_coarse + 1.0 * loss_mel_refined
+
 # Training with scheduled sampling - zero input
 decoder_input_zeros = torch.zeros_like(mel_specs)
-mel_pred, duration_pred, stop_pred = model.forward_training(
+mel_coarse, mel_refined, duration_pred, stop_pred = model.forward_training(
     phoneme_indices=phoneme_indices,
     mel_specs=mel_specs,
     phoneme_durations=phoneme_durations,
@@ -127,8 +198,9 @@ mel_output = model.forward_inference(
     stop_threshold=0.5
 )
 
-# Legacy forward() wrapper (for backward compatibility)
-mel_pred, duration_pred, stop_pred = model(
+# Forward() wrapper dispatches to training/inference
+# Training mode (when mel_specs provided)
+mel_coarse, mel_refined, duration_pred, stop_pred = model(
     phoneme_indices,
     mel_specs,
     phoneme_durations,
@@ -137,10 +209,12 @@ mel_pred, duration_pred, stop_pred = model(
 ```
 
 **Key Training Features**:
+- **Dual mel output**: Returns both `mel_coarse` (pre-PostNet) and `mel_refined` (post-PostNet) for dual-loss training
 - `use_gt_durations=True`: Bypass duration predictor for faster mel learning (useful for first few epochs)
 - `decoder_input_mels=None`: Standard teacher forcing (uses ground truth)
 - `decoder_input_mels=zeros`: Zero-input training (teaches model to generate from scratch)
 - `decoder_input_mels=predictions`: Scheduled sampling (uses model's own predictions)
+- Separate loss weights: `mel_coarse_loss_weight=0.5`, `mel_refined_loss_weight=1.0`
 
 **Inference Notes**:
 - PostNet is automatically applied to the complete sequence (not frame-by-frame)

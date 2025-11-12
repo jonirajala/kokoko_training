@@ -229,17 +229,19 @@ def test_overfit():
     logger.info(f"  Durations: {durations.shape}")
     logger.info(f"  Stop tokens: {stop_tokens.shape}")
 
-    # Loss weights for overfit test
+    # Loss weights for overfit test (DUAL MEL LOSS - Tacotron 2 architecture)
     # Balance mel and duration to train both (needed for inference)
-    mel_loss_weight = 1.0  # Standard weight
+    mel_coarse_loss_weight = 0.5  # Pre-PostNet (decoder supervision)
+    mel_refined_loss_weight = 1.0  # Post-PostNet (final quality)
     duration_loss_weight = 0.01  # Very small - just enough to train duration predictor
     stop_token_loss_weight = 0.1  # Small weight
 
     # Scheduled sampling: gradually increase probability of using predictions vs ground truth
     scheduled_sampling_prob = 0.0  # Start with full teacher forcing
 
-    logger.info(f"Loss weights: mel={mel_loss_weight}, duration={duration_loss_weight}, stop={stop_token_loss_weight}")
+    logger.info(f"Loss weights: mel_coarse={mel_coarse_loss_weight}, mel_refined={mel_refined_loss_weight}, duration={duration_loss_weight}, stop={stop_token_loss_weight}")
     logger.info(f"Scheduled sampling probability: {scheduled_sampling_prob:.2f}")
+    logger.info("Using DUAL MEL LOSS (Tacotron 2): supervising both decoder (coarse) and PostNet (refined)")
     logger.info("Using teacher-forced mel (ground truth as decoder input) + training duration predictor")
 
     # Training loop - extended for better convergence
@@ -259,7 +261,8 @@ def test_overfit():
         return False
 
     losses = []
-    mel_losses = []
+    mel_coarse_losses = []
+    mel_refined_losses = []
     dur_losses = []
     stop_losses = []
 
@@ -289,7 +292,8 @@ def test_overfit():
             # Use scheduled sampling: decoder sees its own predictions
             with torch.no_grad():
                 # Get predictions without gradients for sampling
-                mel_pred_sample, _, _ = model.forward_training(
+                # Model now returns 4 values: mel_coarse, mel_refined, duration, stop
+                _, mel_refined_sample, _, _ = model.forward_training(
                     phoneme_indices=phoneme_indices,
                     mel_specs=mel_spec,
                     phoneme_durations=durations,
@@ -298,18 +302,19 @@ def test_overfit():
                     mel_padding_mask=None,
                     use_gt_durations=False
                 )
-            # Use predicted mels as decoder input (detached to avoid double gradients)
-            decoder_input_mels = mel_pred_sample.detach()
+            # Use refined mel predictions as decoder input (detached to avoid double gradients)
+            decoder_input_mels = mel_refined_sample.detach()
         else:
             # Use ground truth mels as decoder input (teacher forcing)
             decoder_input_mels = mel_spec
 
         # Forward pass with mixed precision (match real training!)
+        # Model now returns BOTH mel_coarse and mel_refined for dual-loss training
         # Use ground truth durations for length regulation (teacher forcing for decoder)
         # But allow duration predictor to train so inference works
         if use_mixed_precision:
             with torch.amp.autocast("cuda", dtype=autocast_dtype):
-                mel_pred, dur_pred, stop_pred = model.forward_training(
+                mel_coarse, mel_refined, dur_pred, stop_pred = model.forward_training(
                     phoneme_indices=phoneme_indices,
                     mel_specs=decoder_input_mels,  # Use scheduled sampling mels
                     phoneme_durations=durations,
@@ -319,7 +324,7 @@ def test_overfit():
                     use_gt_durations=False  # Train duration predictor for inference
                 )
         else:
-            mel_pred, dur_pred, stop_pred = model.forward_training(
+            mel_coarse, mel_refined, dur_pred, stop_pred = model.forward_training(
                 phoneme_indices=phoneme_indices,
                 mel_specs=decoder_input_mels,  # Use scheduled sampling mels
                 phoneme_durations=durations,
@@ -329,8 +334,9 @@ def test_overfit():
                 use_gt_durations=False  # Train duration predictor for inference
             )
 
-        # Compute losses
-        mel_loss = nn.L1Loss(reduction='mean')(mel_pred, mel_spec)
+        # Compute DUAL MEL LOSSES (Tacotron 2 architecture)
+        mel_coarse_loss = nn.L1Loss(reduction='mean')(mel_coarse, mel_spec)  # Pre-PostNet
+        mel_refined_loss = nn.L1Loss(reduction='mean')(mel_refined, mel_spec)  # Post-PostNet
 
         # Duration loss (log space) - very small weight to train duration predictor
         dur_target_log = torch.log(durations.float().clamp(min=1e-5))
@@ -339,8 +345,11 @@ def test_overfit():
         # Stop token loss
         stop_loss = nn.BCEWithLogitsLoss()(stop_pred.squeeze(-1), stop_tokens)
 
-        # Weighted loss - duration_loss_weight is 0.0 so dur_loss term is zero
-        total_loss = mel_loss_weight * mel_loss + duration_loss_weight * dur_loss + stop_token_loss_weight * stop_loss
+        # Weighted loss with DUAL MEL LOSS
+        total_loss = (mel_coarse_loss_weight * mel_coarse_loss +
+                      mel_refined_loss_weight * mel_refined_loss +
+                      duration_loss_weight * dur_loss +
+                      stop_token_loss_weight * stop_loss)
 
         # Backward pass - simplified since duration predictor is frozen
         if use_mixed_precision and autocast_dtype == torch.bfloat16:
@@ -388,7 +397,8 @@ def test_overfit():
 
         # Log
         losses.append(total_loss.item())
-        mel_losses.append(mel_loss.item())
+        mel_coarse_losses.append(mel_coarse_loss.item())
+        mel_refined_losses.append(mel_refined_loss.item())
         dur_losses.append(dur_loss.item())
         stop_losses.append(stop_loss.item())
 
@@ -396,10 +406,12 @@ def test_overfit():
         if iteration == 0:
             logger.info(f"\nIteration 0 (initial):")
             logger.info(f"  Total Loss: {total_loss.item():.6f}")
-            logger.info(f"  Mel Loss: {mel_loss.item():.6f}")
+            logger.info(f"  Mel Coarse Loss (pre-PostNet): {mel_coarse_loss.item():.6f}")
+            logger.info(f"  Mel Refined Loss (post-PostNet): {mel_refined_loss.item():.6f}")
             logger.info(f"  Duration Loss: {dur_loss.item():.6f}")
             logger.info(f"  Stop Loss: {stop_loss.item():.6f}")
-            logger.info(f"  Mel pred mean: {mel_pred.mean().item():.6f}")
+            logger.info(f"  Mel coarse mean: {mel_coarse.mean().item():.6f}")
+            logger.info(f"  Mel refined mean: {mel_refined.mean().item():.6f}")
             logger.info(f"  Mel target mean: {mel_spec.mean().item():.6f}")
 
             # Store initial state for debugging
@@ -429,7 +441,8 @@ def test_overfit():
         if iteration % 10 == 0:
             progress_bar.set_postfix({
                 'total': f'{total_loss.item():.4f}',
-                'mel': f'{mel_loss.item():.4f}',
+                'mel_c': f'{mel_coarse_loss.item():.4f}',
+                'mel_r': f'{mel_refined_loss.item():.4f}',
                 'dur': f'{dur_loss.item():.4f}',
                 'stop': f'{stop_loss.item():.4f}'
             })
@@ -438,15 +451,17 @@ def test_overfit():
         if iteration % 200 == 0 and iteration > 0:
             logger.info(f"\nIteration {iteration}:")
             logger.info(f"  Total Loss: {total_loss.item():.6f}")
-            logger.info(f"  Mel Loss: {mel_loss.item():.6f}")
+            logger.info(f"  Mel Coarse Loss (decoder): {mel_coarse_loss.item():.6f}")
+            logger.info(f"  Mel Refined Loss (PostNet): {mel_refined_loss.item():.6f}")
             logger.info(f"  Duration Loss: {dur_loss.item():.6f}")
             logger.info(f"  Stop Loss: {stop_loss.item():.6f}")
             logger.info(f"  Scheduled sampling prob: {scheduled_sampling_prob:.2f}")
 
-            # Check mel prediction statistics
-            logger.info(f"  Mel pred range: [{mel_pred.min().item():.3f}, {mel_pred.max().item():.3f}]")
+            # Check mel prediction statistics (use refined for final quality)
+            logger.info(f"  Mel coarse range: [{mel_coarse.min().item():.3f}, {mel_coarse.max().item():.3f}]")
+            logger.info(f"  Mel refined range: [{mel_refined.min().item():.3f}, {mel_refined.max().item():.3f}]")
             logger.info(f"  Mel target range: [{mel_spec.min().item():.3f}, {mel_spec.max().item():.3f}]")
-            logger.info(f"  Mel pred std: {mel_pred.std().item():.3f}")
+            logger.info(f"  Mel refined std: {mel_refined.std().item():.3f}")
             logger.info(f"  Mel target std: {mel_spec.std().item():.3f}")
 
             # Duration predictor is being trained (needed for inference)
@@ -461,19 +476,19 @@ def test_overfit():
                 postnet_grad_norm = model.postnet.convolutions[0][0].weight.grad.norm().item()
                 logger.info(f"  PostNet gradient norm: {postnet_grad_norm:.6f}")
 
-            # Check prediction quality with correlation
-            mel_pred_flat = mel_pred.detach().flatten()
+            # Check prediction quality with correlation (use refined for final quality)
+            mel_refined_flat = mel_refined.detach().flatten()
             mel_target_flat = mel_spec.flatten()
-            correlation = torch.corrcoef(torch.stack([mel_pred_flat, mel_target_flat]))[0, 1].item()
-            logger.info(f"  Prediction-target correlation: {correlation:.4f}")
+            correlation = torch.corrcoef(torch.stack([mel_refined_flat, mel_target_flat]))[0, 1].item()
+            logger.info(f"  Refined prediction-target correlation: {correlation:.4f}")
 
             # Check if predictions are stuck at a constant value
-            pred_variance = mel_pred.var().item()
+            refined_variance = mel_refined.var().item()
             target_variance = mel_spec.var().item()
-            logger.info(f"  Prediction variance: {pred_variance:.4f}")
+            logger.info(f"  Refined prediction variance: {refined_variance:.4f}")
             logger.info(f"  Target variance: {target_variance:.4f}")
-            if pred_variance < 0.1:
-                logger.warning(f"  ⚠️  Predictions have very low variance - model might be outputting constants!")
+            if refined_variance < 0.1:
+                logger.warning(f"  ⚠️  Refined predictions have very low variance - model might be outputting constants!")
 
             # CHECK GRADIENTS on mel projection (decoder output) - now has coarse + postnet
             if model.mel_projection_coarse.weight.grad is not None:
@@ -497,18 +512,20 @@ def test_overfit():
     logger.info("="*70)
 
     final_total_loss = losses[-1]
-    final_mel_loss = mel_losses[-1]
+    final_mel_coarse_loss = mel_coarse_losses[-1]
+    final_mel_refined_loss = mel_refined_losses[-1]
     final_dur_loss = dur_losses[-1]
     final_stop_loss = stop_losses[-1]
 
-    logger.info(f"\nFinal losses after 3000 iterations:")
+    logger.info(f"\nFinal losses after {num_iterations} iterations:")
     logger.info(f"  Total Loss: {final_total_loss:.6f}")
-    logger.info(f"  Mel Loss: {final_mel_loss:.6f}")
+    logger.info(f"  Mel Coarse Loss (decoder): {final_mel_coarse_loss:.6f}")
+    logger.info(f"  Mel Refined Loss (PostNet): {final_mel_refined_loss:.6f}")
     logger.info(f"  Duration Loss: {final_dur_loss:.6f}")
     logger.info(f"  Stop Loss: {final_stop_loss:.6f}")
 
-    # Check if overfitting succeeded
-    success = final_mel_loss < 0.1 and final_dur_loss < 0.5
+    # Check if overfitting succeeded (use refined loss for final quality check)
+    success = final_mel_refined_loss < 0.1 and final_dur_loss < 0.5
 
     if success:
         logger.info("\n✅ SUCCESS: Model successfully overfitted to single sample!")
@@ -611,7 +628,7 @@ def test_overfit():
         # SECOND: Test with teacher-forced forward pass (should be near-perfect)
         logger.info("\n--- Teacher-Forced Pass (using ground truth durations) ---")
 
-        mel_pred_tf, dur_pred_tf, stop_pred_tf = model.forward_training(
+        mel_coarse_tf, mel_refined_tf, dur_pred_tf, stop_pred_tf = model.forward_training(
             phoneme_indices=phoneme_indices_single,
             mel_specs=mel_spec_single,
             phoneme_durations=durations_single,
@@ -621,20 +638,21 @@ def test_overfit():
             use_gt_durations=False
         )
 
-        # Check teacher-forced quality
-        tf_mel_loss = nn.L1Loss()(mel_pred_tf, mel_spec_single).item()
+        # Check teacher-forced quality (use refined for final quality)
+        tf_mel_loss = nn.L1Loss()(mel_refined_tf, mel_spec_single).item()
         tf_correlation = torch.corrcoef(torch.stack([
-            mel_pred_tf.flatten(),
+            mel_refined_tf.flatten(),
             mel_spec_single.flatten()
         ]))[0, 1].item()
 
-        logger.info(f"Teacher-forced mel loss: {tf_mel_loss:.6f}")
+        logger.info(f"Teacher-forced mel coarse loss: {nn.L1Loss()(mel_coarse_tf, mel_spec_single).item():.6f}")
+        logger.info(f"Teacher-forced mel refined loss: {tf_mel_loss:.6f}")
         logger.info(f"Teacher-forced correlation: {tf_correlation:.4f}")
-        logger.info(f"Teacher-forced mel range: [{mel_pred_tf.min().item():.3f}, {mel_pred_tf.max().item():.3f}]")
+        logger.info(f"Teacher-forced mel refined range: [{mel_refined_tf.min().item():.3f}, {mel_refined_tf.max().item():.3f}]")
 
-        # Generate audio from teacher-forced mels
-        logger.info("\nGenerating audio from teacher-forced mels...")
-        mel_for_vocoder_tf = mel_pred_tf.squeeze(0).transpose(0, 1).cpu()  # (mel_dim, frames)
+        # Generate audio from teacher-forced mels (use refined for final quality)
+        logger.info("\nGenerating audio from teacher-forced mels (refined)...")
+        mel_for_vocoder_tf = mel_refined_tf.squeeze(0).transpose(0, 1).cpu()  # (mel_dim, frames)
 
         # Reuse the same vocoder instance
         audio_tf = vocoder_manager.mel_to_audio(mel_for_vocoder_tf)
@@ -661,7 +679,7 @@ def test_overfit():
 
         for refine_step in range(num_refinement_steps):
             with torch.no_grad():
-                mel_pred_iter, _, _ = model.forward_training(
+                _, mel_refined_iter, _, _ = model.forward_training(
                     phoneme_indices=phoneme_indices_single,
                     mel_specs=decoder_input_iter,
                     phoneme_durations=durations_single,  # Use GT durations
@@ -670,15 +688,15 @@ def test_overfit():
                     mel_padding_mask=None,
                     use_gt_durations=False
                 )
-                # Use prediction as next input (iterative refinement)
-                decoder_input_iter = mel_pred_iter.detach()
+                # Use refined prediction as next input (iterative refinement)
+                decoder_input_iter = mel_refined_iter.detach()
 
                 if refine_step == 0:
-                    mel_loss_iter = nn.L1Loss()(mel_pred_iter, mel_spec_single).item()
+                    mel_loss_iter = nn.L1Loss()(mel_refined_iter, mel_spec_single).item()
                     logger.info(f"  Step {refine_step}: mel_loss={mel_loss_iter:.4f}")
 
         # Final refinement
-        mel_pred_parallel, _, _ = model.forward_training(
+        mel_coarse_parallel, mel_refined_parallel, _, _ = model.forward_training(
             phoneme_indices=phoneme_indices_single,
             mel_specs=decoder_input_iter,
             phoneme_durations=durations_single,  # Use GT durations
@@ -688,14 +706,14 @@ def test_overfit():
             use_gt_durations=False
         )
 
-        mel_loss_final = nn.L1Loss()(mel_pred_parallel, mel_spec_single).item()
+        mel_loss_final = nn.L1Loss()(mel_refined_parallel, mel_spec_single).item()
         logger.info(f"  Final: mel_loss={mel_loss_final:.4f}")
-        logger.info(f"Parallel generated mel shape: {mel_pred_parallel.shape}")
-        logger.info(f"Parallel mel range: [{mel_pred_parallel.min().item():.3f}, {mel_pred_parallel.max().item():.3f}]")
+        logger.info(f"Parallel generated mel shape: {mel_refined_parallel.shape}")
+        logger.info(f"Parallel mel refined range: [{mel_refined_parallel.min().item():.3f}, {mel_refined_parallel.max().item():.3f}]")
 
-        # Generate audio from parallel inference
-        logger.info("\nGenerating audio from iterative refinement...")
-        mel_for_vocoder_parallel = mel_pred_parallel.squeeze(0).transpose(0, 1).cpu()
+        # Generate audio from parallel inference (use refined)
+        logger.info("\nGenerating audio from iterative refinement (refined)...")
+        mel_for_vocoder_parallel = mel_refined_parallel.squeeze(0).transpose(0, 1).cpu()
         audio_parallel = vocoder_manager.mel_to_audio(mel_for_vocoder_parallel)
 
         output_path_parallel = output_dir / "overfit_parallel.wav"

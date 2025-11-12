@@ -168,22 +168,45 @@ class EnglishTrainer:
         self.criterion_duration = nn.MSELoss(reduction='none')
         self.criterion_stop_token = nn.BCEWithLogitsLoss(reduction='none')
 
-        # Learning rate scheduler
-        # Convert T_0 from epochs to batches since we call scheduler.step() per batch
+        # Learning rate scheduler with warmup
+        # Convert epochs to batches since we call scheduler.step() per batch
         num_batches_per_epoch = len(self.dataloader)
+
+        # Warmup configuration
+        warmup_epochs = getattr(config, 'warmup_epochs', 10)
+        warmup_batches = warmup_epochs * num_batches_per_epoch
+
+        # Cosine annealing configuration
         T_0_epochs = getattr(config, 'lr_T_0', 20)
         T_0_batches = T_0_epochs * num_batches_per_epoch
 
-        logger.info(f"Learning rate scheduler: CosineAnnealingWarmRestarts")
-        logger.info(f"  T_0: {T_0_epochs} epochs = {T_0_batches} batches")
-        logger.info(f"  T_mult: {getattr(config, 'lr_T_mult', 2)}")
-        logger.info(f"  eta_min: {getattr(config, 'lr_eta_min', 1e-6)}")
+        logger.info(f"Learning rate scheduler: LinearLR warmup + CosineAnnealingWarmRestarts")
+        logger.info(f"  Warmup: {warmup_epochs} epochs = {warmup_batches} batches (0 → {config.learning_rate})")
+        logger.info(f"  Cosine T_0: {T_0_epochs} epochs = {T_0_batches} batches")
+        logger.info(f"  Cosine T_mult: {getattr(config, 'lr_T_mult', 2)}")
+        logger.info(f"  Cosine eta_min: {getattr(config, 'lr_eta_min', 1e-6)}")
 
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        # Create warmup scheduler (LinearLR from start_factor to 1.0)
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            self.optimizer,
+            start_factor=1e-10,  # Start near 0 (1e-10 * LR ≈ 0)
+            end_factor=1.0,      # End at full LR
+            total_iters=warmup_batches
+        )
+
+        # Create cosine annealing scheduler
+        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             self.optimizer,
             T_0=T_0_batches,
             T_mult=getattr(config, 'lr_T_mult', 2),
             eta_min=getattr(config, 'lr_eta_min', 1e-6)
+        )
+
+        # Chain them together with SequentialLR
+        self.scheduler = torch.optim.lr_scheduler.SequentialLR(
+            self.optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[warmup_batches]  # Switch to cosine after warmup_batches
         )
 
         # Training state
@@ -351,13 +374,15 @@ class EnglishTrainer:
                     max_prob = getattr(self.config, 'scheduled_sampling_max_prob', 0.5)
 
                     if global_step < warmup:
-                        scheduled_sampling_prob = 0.0  # Pure teacher forcing
+                        # Pure teacher forcing during warmup
+                        scheduled_sampling_prob = 0.0
                     elif global_step < warmup * 2:
-                        scheduled_sampling_prob = 0.1  # Gentle exposure
-                    elif global_step < warmup * 4:
-                        scheduled_sampling_prob = 0.3  # Building robustness
+                        # Linear ramp from 0 to max_prob over [warmup, warmup*2]
+                        progress = (global_step - warmup) / warmup
+                        scheduled_sampling_prob = progress * max_prob
                     else:
-                        scheduled_sampling_prob = max_prob  # Full exposure
+                        # Full scheduled sampling exposure
+                        scheduled_sampling_prob = max_prob
 
                     # Apply scheduled sampling
                     sample_mode = torch.rand(1).item()
@@ -371,12 +396,14 @@ class EnglishTrainer:
                         with torch.no_grad():
                             if self.use_mixed_precision:
                                 with self.get_autocast_context():
-                                    mel_pred_sample, _, _ = self.model(
+                                    # Model now returns 4 values: mel_coarse, mel_refined, durations, stop
+                                    _, mel_pred_sample, _, _ = self.model(
                                         phoneme_indices, mel_specs, phoneme_durations,
                                         stop_token_targets, use_gt_durations=False
                                     )
                             else:
-                                mel_pred_sample, _, _ = self.model(
+                                # Model now returns 4 values: mel_coarse, mel_refined, durations, stop
+                                _, mel_pred_sample, _, _ = self.model(
                                     phoneme_indices, mel_specs, phoneme_durations,
                                     stop_token_targets, use_gt_durations=False
                                 )
@@ -384,29 +411,30 @@ class EnglishTrainer:
                     # else: decoder_input_mels stays None (teacher forcing with ground truth)
 
                 # Forward pass with scheduled sampling
+                # Model now returns BOTH mel_coarse and mel_refined for dual-loss training
                 with torch.profiler.record_function("Model_Forward"):
                     if self.use_mixed_precision:
                         with self.get_autocast_context():
-                            predicted_mel, predicted_log_durations, predicted_stop_logits = \
+                            mel_coarse, mel_refined, predicted_log_durations, predicted_stop_logits = \
                                 self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
                                           use_gt_durations=use_gt_durs, decoder_input_mels=decoder_input_mels)
                     else:
-                        predicted_mel, predicted_log_durations, predicted_stop_logits = \
+                        mel_coarse, mel_refined, predicted_log_durations, predicted_stop_logits = \
                             self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
                                       use_gt_durations=use_gt_durs, decoder_input_mels=decoder_input_mels)
 
-                # Loss calculation
+                # Loss calculation with dual mel loss (pre-PostNet + post-PostNet)
                 with torch.profiler.record_function("Loss_Calculation"):
                     if self.use_mixed_precision:
                         with self.get_autocast_context():
-                            total_loss, loss_mel, loss_duration, loss_stop_token = self._calculate_losses(
-                                predicted_mel, predicted_log_durations, predicted_stop_logits,
+                            total_loss, loss_mel_coarse, loss_mel_refined, loss_duration, loss_stop_token = self._calculate_losses(
+                                mel_coarse, mel_refined, predicted_log_durations, predicted_stop_logits,
                                 mel_specs, phoneme_durations, stop_token_targets,
                                 mel_lengths, phoneme_lengths
                             )
                     else:
-                        total_loss, loss_mel, loss_duration, loss_stop_token = self._calculate_losses(
-                            predicted_mel, predicted_log_durations, predicted_stop_logits,
+                        total_loss, loss_mel_coarse, loss_mel_refined, loss_duration, loss_stop_token = self._calculate_losses(
+                            mel_coarse, mel_refined, predicted_log_durations, predicted_stop_logits,
                             mel_specs, phoneme_durations, stop_token_targets,
                             mel_lengths, phoneme_lengths
                         )
@@ -464,13 +492,17 @@ class EnglishTrainer:
 
                 # Cache loss values (single .item() call per loss - no duplicate GPU syncs)
                 loss_total_val = total_loss.item()
-                loss_mel_val = loss_mel.item()
+                loss_mel_coarse_val = loss_mel_coarse.item()
+                loss_mel_refined_val = loss_mel_refined.item()
                 loss_dur_val = loss_duration.item()
                 loss_stop_val = loss_stop_token.item()
 
+                # Combined mel loss for backward compatibility (unweighted average)
+                loss_mel_combined = (loss_mel_coarse_val + loss_mel_refined_val) / 2.0
+
                 # Accumulate losses using cached values
                 total_loss_epoch += loss_total_val
-                mel_loss_epoch += loss_mel_val
+                mel_loss_epoch += loss_mel_combined  # Use combined for epoch average
                 dur_loss_epoch += loss_dur_val
                 stop_loss_epoch += loss_stop_val
 
@@ -479,7 +511,9 @@ class EnglishTrainer:
                 if self.use_wandb and batch_idx % 50 == 0:
                     wandb_metrics = {
                         "train/batch_total_loss": loss_total_val,
-                        "train/batch_mel_loss": loss_mel_val,
+                        "train/batch_mel_loss_coarse": loss_mel_coarse_val,
+                        "train/batch_mel_loss_refined": loss_mel_refined_val,
+                        "train/batch_mel_loss_combined": loss_mel_combined,
                         "train/batch_duration_loss": loss_dur_val,
                         "train/batch_stop_loss": loss_stop_val,
                         "train/learning_rate": self.optimizer.param_groups[0]['lr'],
@@ -494,9 +528,11 @@ class EnglishTrainer:
                     self.log_to_wandb(wandb_metrics, step=global_step, commit=False)
 
                 # Update progress bar using cached values
+                # Show refined mel loss (final quality) and coarse (decoder quality)
                 postfix_dict = {
                     'total_loss': loss_total_val,
-                    'mel_loss': loss_mel_val,
+                    'mel_refined': loss_mel_refined_val,
+                    'mel_coarse': loss_mel_coarse_val,
                     'dur_loss': loss_dur_val,
                     'stop_loss': loss_stop_val,
                     'lr': self.optimizer.param_groups[0]['lr']
@@ -590,11 +626,13 @@ class EnglishTrainer:
 
             # Log scheduled sampling configuration
             if getattr(self.config, 'enable_scheduled_sampling', False):
+                warmup = getattr(self.config, 'scheduled_sampling_warmup_batches', 500)
+                max_prob = getattr(self.config, 'scheduled_sampling_max_prob', 0.5)
                 logger.info("Scheduled Sampling: ENABLED (critical for inference quality)")
-                logger.info(f"  Warmup batches: {getattr(self.config, 'scheduled_sampling_warmup_batches', 500)}")
-                logger.info(f"  Max probability: {getattr(self.config, 'scheduled_sampling_max_prob', 0.5)}")
+                logger.info(f"  Warmup batches: {warmup}")
+                logger.info(f"  Max probability: {max_prob}")
                 logger.info(f"  Zero-input ratio: {getattr(self.config, 'scheduled_sampling_zero_input_ratio', 0.3)}")
-                logger.info("  Schedule: 0-500 batches (prob=0.0), 500-1000 (0.1), 1000-2000 (0.3), 2000+ (0.5)")
+                logger.info(f"  Schedule: 0-{warmup} batches (prob=0.0), {warmup}-{warmup*2} (linear ramp 0.0→{max_prob}), {warmup*2}+ (prob={max_prob})")
             else:
                 logger.warning("⚠️  Scheduled Sampling: DISABLED - Model may produce garbage audio at inference!")
                 logger.warning("   Enable with 'enable_scheduled_sampling: True' in config")
@@ -749,21 +787,35 @@ class EnglishTrainer:
         elif self.device.type == DeviceType.MPS.value:
             torch.mps.empty_cache()
 
-    def _calculate_losses(self, predicted_mel, predicted_log_durations, predicted_stop_logits,
+    def _calculate_losses(self, mel_coarse, mel_refined, predicted_log_durations, predicted_stop_logits,
                          mel_specs, phoneme_durations, stop_token_targets,
                          mel_lengths, phoneme_lengths):
-        """Numerically stable loss calculation with masking."""
+        """
+        Numerically stable loss calculation with masking.
+
+        Implements dual mel loss (Tacotron 2 architecture):
+        - loss_mel_coarse: Direct supervision of decoder output (pre-PostNet)
+        - loss_mel_refined: Supervision of PostNet refinement (post-PostNet)
+
+        Returns:
+            total_loss, loss_mel_coarse, loss_mel_refined, loss_duration, loss_stop_token
+        """
         eps = 1e-8
 
-        # --- Mel Spectrogram Loss ---
+        # --- Dual Mel Spectrogram Loss (Pre-PostNet + Post-PostNet) ---
         max_mel_len_batch = mel_specs.size(1)
         mel_mask = (torch.arange(max_mel_len_batch, device=self.device)
                     .expand(len(mel_lengths), max_mel_len_batch)
                     < mel_lengths.unsqueeze(1))
-        mel_mask = mel_mask.unsqueeze(-1).expand_as(predicted_mel).float()
+        mel_mask = mel_mask.unsqueeze(-1).expand_as(mel_coarse).float()
 
-        loss_mel_unreduced = self.criterion_mel(predicted_mel, mel_specs)
-        loss_mel = (loss_mel_unreduced * mel_mask).sum() / (mel_mask.sum() + eps)
+        # Pre-PostNet loss (coarse mel from decoder)
+        loss_mel_coarse_unreduced = self.criterion_mel(mel_coarse, mel_specs)
+        loss_mel_coarse = (loss_mel_coarse_unreduced * mel_mask).sum() / (mel_mask.sum() + eps)
+
+        # Post-PostNet loss (refined mel after PostNet)
+        loss_mel_refined_unreduced = self.criterion_mel(mel_refined, mel_specs)
+        loss_mel_refined = (loss_mel_refined_unreduced * mel_mask).sum() / (mel_mask.sum() + eps)
 
         # --- Duration Loss ---
         max_phoneme_len_batch = phoneme_durations.size(1)
@@ -787,14 +839,19 @@ class EnglishTrainer:
             )
         loss_stop_token = (loss_stop_token_unreduced * stop_token_mask).sum() / (stop_token_mask.sum() + eps)
 
-        # --- Combine ---
+        # --- Combine with Dual Mel Loss ---
+        # Apply separate weights to pre-PostNet and post-PostNet losses
+        weighted_mel_coarse = loss_mel_coarse * self.config.mel_coarse_loss_weight
+        weighted_mel_refined = loss_mel_refined * self.config.mel_refined_loss_weight
+
         total_loss = (
-            loss_mel +
+            weighted_mel_coarse +
+            weighted_mel_refined +
             loss_duration * self.config.duration_loss_weight +
             loss_stop_token * self.config.stop_token_loss_weight
         )
 
-        return total_loss, loss_mel, loss_duration, loss_stop_token
+        return total_loss, loss_mel_coarse, loss_mel_refined, loss_duration, loss_stop_token
 
     def setup_checkpoint_resumption(self):
         """Handle checkpoint resumption with mixed precision state"""
@@ -1230,11 +1287,11 @@ class EnglishTrainer:
                 with torch.profiler.record_function("Model_Forward"):
                     if self.use_mixed_precision:
                         with self.get_autocast_context():
-                            predicted_mel, predicted_log_durations, predicted_stop_logits = \
+                            mel_coarse, mel_refined, predicted_log_durations, predicted_stop_logits = \
                                 self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
                                           use_gt_durations=use_gt_durs)
                     else:
-                        predicted_mel, predicted_log_durations, predicted_stop_logits = \
+                        mel_coarse, mel_refined, predicted_log_durations, predicted_stop_logits = \
                             self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
                                       use_gt_durations=use_gt_durs)
                 self.interbatch_profiler.end_forward_pass()
@@ -1245,14 +1302,14 @@ class EnglishTrainer:
                 with torch.profiler.record_function("Loss_Calculation"):
                     if self.use_mixed_precision:
                         with self.get_autocast_context():
-                            total_loss, loss_mel, loss_duration, loss_stop_token = self._calculate_losses(
-                                predicted_mel, predicted_log_durations, predicted_stop_logits,
+                            total_loss, loss_mel_coarse, loss_mel_refined, loss_duration, loss_stop_token = self._calculate_losses(
+                                mel_coarse, mel_refined, predicted_log_durations, predicted_stop_logits,
                                 mel_specs, phoneme_durations, stop_token_targets,
                                 mel_lengths, phoneme_lengths
                             )
                     else:
-                        total_loss, loss_mel, loss_duration, loss_stop_token = self._calculate_losses(
-                            predicted_mel, predicted_log_durations, predicted_stop_logits,
+                        total_loss, loss_mel_coarse, loss_mel_refined, loss_duration, loss_stop_token = self._calculate_losses(
+                            mel_coarse, mel_refined, predicted_log_durations, predicted_stop_logits,
                             mel_specs, phoneme_durations, stop_token_targets,
                             mel_lengths, phoneme_lengths
                         )

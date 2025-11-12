@@ -56,26 +56,26 @@ def parse_arguments():
     parser.add_argument(
         '--batch-size', '-b',
         type=int,
-        default=16,
-        help='Batch size for training (default: 16)'
+        default=None,
+        help='Batch size for training (default: from config)'
     )
     parser.add_argument(
         '--epochs', '-e',
         type=int,
-        default=100,
-        help='Number of training epochs (default: 100)'
+        default=None,
+        help='Number of training epochs (default: from config)'
     )
     parser.add_argument(
         '--learning-rate', '-lr',
         type=float,
-        default=1e-4,
-        help='Learning rate (default: 1e-4)'
+        default=None,
+        help='Learning rate (default: from config)'
     )
     parser.add_argument(
         '--save-every',
         type=int,
-        default=2,
-        help='Save checkpoint every N epochs (default: 2)'
+        default=None,
+        help='Save checkpoint every N epochs (default: from config)'
     )
 
     # Resume training
@@ -182,13 +182,18 @@ def create_config_from_args(args) -> EnglishTrainingConfig:
     else:
         config = get_default_config()
 
-    # Override with command line arguments
+    # Override with command line arguments (only if explicitly provided)
     config.data_dir = args.corpus
     config.output_dir = args.output
-    config.batch_size = args.batch_size
-    config.num_epochs = args.epochs
-    config.learning_rate = args.learning_rate
-    config.save_every = args.save_every
+
+    if args.batch_size is not None:
+        config.batch_size = args.batch_size
+    if args.epochs is not None:
+        config.num_epochs = args.epochs
+    if args.learning_rate is not None:
+        config.learning_rate = args.learning_rate
+    if args.save_every is not None:
+        config.save_every = args.save_every
 
     if args.resume:
         config.resume_checkpoint = args.resume

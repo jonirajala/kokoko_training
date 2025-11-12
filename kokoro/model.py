@@ -449,15 +449,27 @@ class KokoroModel(nn.Module):
         mel_padding_mask: Optional[torch.Tensor] = None,
         use_gt_durations: bool = False,
         decoder_input_mels: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Enhanced training forward pass with gradient checkpointing enabled by default
+
+        Returns:
+            Tuple containing:
+                - mel_coarse: Coarse mel prediction from decoder (pre-PostNet)
+                - mel_refined: Refined mel prediction (post-PostNet)
+                - predicted_log_durations: Log durations
+                - predicted_stop_logits: Stop token logits
 
         Args:
             decoder_input_mels: Optional mel spectrograms to use as decoder input.
                               If None, uses mel_specs with teacher forcing (standard training).
                               For scheduled sampling, pass model predictions or zeros.
                               Shape: (batch, mel_seq_len, mel_dim)
+
+        Note:
+            Returns BOTH mel_coarse and mel_refined for dual-loss training.
+            This enables direct supervision of decoder (mel_coarse) while also
+            supervising the PostNet refinement (mel_refined).
         """
         with torch.profiler.record_function("forward_training"):
             batch_size, mel_seq_len = mel_specs.shape[0], mel_specs.shape[1]
@@ -571,29 +583,30 @@ class KokoroModel(nn.Module):
                         self.profiler.log_memory_stats("output_projections_start")
 
                     # Project decoder outputs with checkpointing
-                    # CRITICAL FIX: Use coarse + postnet architecture
+                    # DUAL-LOSS ARCHITECTURE: Return both coarse and refined predictions
+                    # This enables direct supervision of both decoder and PostNet
                     if self.gradient_checkpointing and self.training:
-                        # Coarse mel prediction
+                        # Coarse mel prediction (pre-PostNet)
                         mel_coarse = checkpoint(
                             self.mel_projection_coarse, decoder_outputs, use_reentrant=False
                         )
                         # Refine with postnet (residual connection)
-                        # Scale residual by 0.5 to stabilize training while allowing sufficient refinement
                         mel_residual = checkpoint(
                             self.postnet, mel_coarse, use_reentrant=False
                         )
-                        predicted_mel_frames = mel_coarse + 0.5 * mel_residual
+                        # Refined mel (post-PostNet) - full residual without scaling
+                        mel_refined = mel_coarse + mel_residual
 
                         predicted_stop_logits = checkpoint(
                             self.stop_token_predictor, decoder_outputs, use_reentrant=False
                         ).squeeze(-1)
                     else:
-                        # Coarse mel prediction
+                        # Coarse mel prediction (pre-PostNet)
                         mel_coarse = self.mel_projection_coarse(decoder_outputs)
                         # Refine with postnet (residual connection)
-                        # Scale residual by 0.5 to stabilize training while allowing sufficient refinement
                         mel_residual = self.postnet(mel_coarse)
-                        predicted_mel_frames = mel_coarse + 0.5 * mel_residual
+                        # Refined mel (post-PostNet) - full residual without scaling
+                        mel_refined = mel_coarse + mel_residual
 
                         predicted_stop_logits = self.stop_token_predictor(decoder_outputs).squeeze(-1)
 
@@ -604,7 +617,8 @@ class KokoroModel(nn.Module):
                 if self.enable_profiling:
                     self.profiler.log_memory_stats("training_end")
 
-                return predicted_mel_frames, predicted_log_durations, predicted_stop_logits
+                # Return BOTH coarse and refined for dual-loss training
+                return mel_coarse, mel_refined, predicted_log_durations, predicted_stop_logits
 
             except Exception as e:
                 logger.error(f"Error in forward_training: {e}")

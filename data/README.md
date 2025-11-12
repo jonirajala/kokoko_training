@@ -2,6 +2,17 @@
 
 Dataset loading and phoneme processing for English TTS.
 
+## LJSpeech Dataset Statistics
+
+- **Number of samples**: 13,100
+- **Audio duration**:
+  - Minimum: 1.11 seconds
+  - Maximum: 10.10 seconds
+  - Average: 6.57 seconds
+  - Median: 6.76 seconds
+  - Standard deviation: 2.19 seconds
+- **Total duration**: 23.92 hours (1,435.28 minutes / 86,117.08 seconds)
+
 ## Files
 
 `ljspeech_dataset.py` loads and processes the LJSpeech dataset (13,100 English speech samples) with MFA alignments. Includes `LJSpeechDataset` for data loading, `LengthBasedBatchSampler` for smart batching by sequence length, and `collate_fn` for batch padding. Reads MFA TextGrid alignments for duration, converts audio to mel spectrograms, handles variable-length sequences. Batching by length reduces padding by ~30-40%.
