@@ -17,9 +17,9 @@ class EnglishTrainingConfig:
     output_dir: str = "output_models_english"
 
     # Basic training parameters
-    num_epochs: int = 100
+    num_epochs: int = 300  # Extended for full convergence
     batch_size: int = 32        # Optimal for RTX 4090 with BF16
-    learning_rate: float = 1e-4 # Increased from 7e-5 to escape local minima
+    learning_rate: float = 1.5e-4 # Increased from 1e-4 to escape plateau at epoch 200
     device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
     # Learning Rate Reasoning (batch=32, BF16):
@@ -38,9 +38,9 @@ class EnglishTrainingConfig:
     # - Batch 64: 7.5e-5 to 8e-5 (upper limit, monitor closely)
 
     # Learning rate scheduler (Cosine Annealing with Warm Restarts)
-    lr_T_0: int = 20          # Number of epochs for first restart
-    lr_T_mult: int = 2        # Factor to increase T_i after restart
-    lr_eta_min: float = 1e-6  # Minimum learning rate (floor for annealing)
+    lr_T_0: int = 50          # Number of epochs for first restart (longer cycles)
+    lr_T_mult: int = 1        # Keep same cycle length (no exponential increase)
+    lr_eta_min: float = 5e-6  # Minimum learning rate (raised floor for faster learning)
 
     # Optimizer parameters (AdamW - optimal for transformers)
     weight_decay: float = 0.01  # Increased from 0.005 for BF16 stability
@@ -60,7 +60,8 @@ class EnglishTrainingConfig:
 
     # Loss weights (FIXED: gradient imbalance caused by duration_loss_weight=1.0)
     # Overfit test proved 0.01 works perfectly - mel loss 0.016, perfect audio
-    duration_loss_weight: float = 0.01  # Very small to prevent gradient explosion (was 0.25, then 1.0)
+    # REDUCED: At epoch 200+, focus more on mel quality, less on duration accuracy
+    duration_loss_weight: float = 0.005  # Reduced from 0.01 to focus on mel quality
     stop_token_loss_weight: float = 0.1 # Weight for stop token loss
 
     # Audio processing parameters (optimized for LJSpeech)
@@ -84,9 +85,9 @@ class EnglishTrainingConfig:
     persistent_workers: bool = True     # Keep workers alive between epochs (only used if num_workers > 0)
 
     # Checkpointing
-    save_every: int = 5                 # Save checkpoint every N epochs (increased to save disk space)
+    save_every: int = 10                # Save checkpoint every N epochs (reduced frequency to save disk space)
     resume_checkpoint: str = 'auto'     # Resume from checkpoint ('auto' for latest, or path to .pth)
-    keep_last_n_checkpoints: int = 3    # Only keep the last N checkpoints (auto-delete old ones)
+    keep_last_n_checkpoints: int = 2    # Only keep the last N checkpoints (auto-delete old ones)
 
     # Gradient checkpointing (memory optimization)
     gradient_checkpointing: bool = True # Enable gradient checkpointing
@@ -112,16 +113,16 @@ class EnglishTrainingConfig:
     # Scheduled Sampling (CRITICAL for inference quality)
     # Gradually exposes model to its own predictions during training to reduce exposure bias
     # Without this, model trains with perfect inputs but fails at inference with imperfect predictions
-    # DELAYED START: Wait until mel loss < 0.5 (epoch 30-40) before starting
-    # IMPORTANT: Starting too early causes loss spikes when model predictions are still poor
-    enable_scheduled_sampling: bool = True  # Enable scheduled sampling
+    # AT EPOCH 200+: Use VERY gentle sampling to avoid spikes while maintaining robustness
+    # The spikes were caused by TOO MUCH sampling (15%) when mel_loss was still high
+    enable_scheduled_sampling: bool = True  # KEEP ENABLED for inference quality
     scheduled_sampling_warmup_batches: int = 12000  # Pure teacher forcing for first N batches (~30 epochs)
-    scheduled_sampling_max_prob: float = 0.15      # Maximum sampling probability (conservative)
-    scheduled_sampling_zero_input_ratio: float = 0.1  # 10% of sampling time uses zero input
+    scheduled_sampling_max_prob: float = 0.05      # REDUCED from 0.15 to 0.05 (5% sampling only)
+    scheduled_sampling_zero_input_ratio: float = 0.05  # REDUCED from 0.1 to 0.05 (gentler)
     # Schedule: 0-12000 batches: prob=0.0 (teacher forcing - let model learn basics)
-    #           12000-16000: prob=0.05 (very gentle exposure)
-    #           16000-24000: prob=0.10 (gentle exposure)
-    #           24000+: prob=0.15 (moderate exposure)
+    #           12000-16000: prob=0.02 (ultra-gentle exposure)
+    #           16000-24000: prob=0.03 (very gentle exposure)
+    #           24000+: prob=0.05 (gentle exposure - prevents spikes while building robustness)
 
     # Ground Truth Durations (IMPORTANT for early training stability)
     # Using GT durations bypasses duration predictor, allowing mel predictor to learn faster
