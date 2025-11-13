@@ -43,11 +43,12 @@ class EnglishTrainingConfig:
     # - Large 62M transformer needs gentle start to prevent instability
     # - 10 epochs = ~4,100 steps (standard for transformers: 4k-8k steps)
     # - Prevents early loss spikes and improves final convergence by 5-10%
-    # - Schedule: epochs 0-10 (linear ramp 0→1.5e-4), epochs 10+ (cosine annealing)
+    # - Schedule: epochs 0-10 (linear ramp 0→1e-3), epochs 10+ (cosine annealing)
 
-    # Learning rate scheduler (Cosine Annealing with Warm Restarts)
-    lr_T_0: int = 50          # Number of epochs for first restart (longer cycles)
-    lr_T_mult: int = 1        # Keep same cycle length (no exponential increase)
+    # Learning rate scheduler (Cosine Annealing - NO RESTARTS)
+    # FIXED: Removed CosineAnnealingWarmRestarts to prevent catastrophic LR spikes
+    # Restarts caused training collapse at epoch 60 (mel_loss 0.4 → 3.0)
+    # Now uses smooth monotonic decay: learning_rate → lr_eta_min over full training
     lr_eta_min: float = 5e-6  # Minimum learning rate (raised floor for faster learning)
 
     # Optimizer parameters (AdamW - optimal for transformers)

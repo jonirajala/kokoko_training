@@ -176,15 +176,16 @@ class EnglishTrainer:
         warmup_epochs = getattr(config, 'warmup_epochs', 10)
         warmup_batches = warmup_epochs * num_batches_per_epoch
 
-        # Cosine annealing configuration
-        T_0_epochs = getattr(config, 'lr_T_0', 20)
-        T_0_batches = T_0_epochs * num_batches_per_epoch
+        # Cosine annealing configuration (NO RESTARTS - smooth monotonic decay)
+        # Total batches for cosine decay (after warmup completes)
+        total_training_batches = config.num_epochs * num_batches_per_epoch
+        cosine_batches = total_training_batches - warmup_batches
 
-        logger.info(f"Learning rate scheduler: LinearLR warmup + CosineAnnealingWarmRestarts")
+        logger.info(f"Learning rate scheduler: LinearLR warmup + CosineAnnealingLR")
         logger.info(f"  Warmup: {warmup_epochs} epochs = {warmup_batches} batches (0 → {config.learning_rate})")
-        logger.info(f"  Cosine T_0: {T_0_epochs} epochs = {T_0_batches} batches")
-        logger.info(f"  Cosine T_mult: {getattr(config, 'lr_T_mult', 2)}")
+        logger.info(f"  Cosine: {config.num_epochs - warmup_epochs} epochs = {cosine_batches} batches")
         logger.info(f"  Cosine eta_min: {getattr(config, 'lr_eta_min', 1e-6)}")
+        logger.info(f"  NO RESTARTS - smooth monotonic decay for stable training")
 
         # Create warmup scheduler (LinearLR from start_factor to 1.0)
         warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
@@ -194,11 +195,11 @@ class EnglishTrainer:
             total_iters=warmup_batches
         )
 
-        # Create cosine annealing scheduler
-        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        # Create cosine annealing scheduler (NO RESTARTS!)
+        # CosineAnnealingLR: smooth decay from learning_rate to eta_min over T_max batches
+        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer,
-            T_0=T_0_batches,
-            T_mult=getattr(config, 'lr_T_mult', 2),
+            T_max=cosine_batches,  # Decay over remaining training batches
             eta_min=getattr(config, 'lr_eta_min', 1e-6)
         )
 
