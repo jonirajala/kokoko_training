@@ -622,8 +622,8 @@ class EnglishTrainer:
             logger.info(f"Total epochs: {self.config.num_epochs}, Starting from epoch: {self.start_epoch + 1}")
             logger.info(f"Model vocabulary size: {self.dataset.phoneme_processor.get_vocab_size()}")
             logger.info(f"Initial learning rate: {self.config.learning_rate}")
-            logger.info(f"Scheduler: CosineAnnealingWarmRestarts (T_0={self.config.lr_T_0}, T_mult={self.config.lr_T_mult}, eta_min={self.config.lr_eta_min})")
-            logger.info(f"Loss weights: Mel={1.0}, Duration={self.config.duration_loss_weight}, StopToken={self.config.stop_token_loss_weight}")
+            logger.info(f"Scheduler: LinearLR warmup + CosineAnnealingLR (no restarts, eta_min={self.config.lr_eta_min})")
+            logger.info(f"Loss weights: Mel Coarse={self.config.mel_coarse_loss_weight}, Mel Refined={self.config.mel_refined_loss_weight}, Duration={self.config.duration_loss_weight}, StopToken={self.config.stop_token_loss_weight}")
 
             # Log scheduled sampling configuration
             if getattr(self.config, 'enable_scheduled_sampling', False):
