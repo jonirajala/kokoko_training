@@ -442,12 +442,16 @@ class EnglishTrainer:
 
                 # Backward pass
                 # ========== Backward + Optimizer Step  ==========
+                # Track gradient norm for monitoring explosions
+                grad_norm_val = 0.0
+
                 with torch.profiler.record_function("Backward_Pass"):
                     if self.use_mixed_precision and self.autocast_dtype == torch.bfloat16:
                         # ✅ BF16 path (no GradScaler needed - inherently stable)
                         self.optimizer.zero_grad(set_to_none=True)
                         total_loss.backward()
-                        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                        grad_norm_val = grad_norm.item() if torch.isfinite(grad_norm) else 0.0
 
                         if not torch.isfinite(grad_norm):
                             logger.warning(f"[Batch {batch_idx}] Non-finite grad norm ({grad_norm:.2f}). Skipping batch.")
@@ -461,7 +465,8 @@ class EnglishTrainer:
                         # FP16 path with GradScaler (backward compatibility)
                         self.scaler.scale(total_loss).backward()
                         self.scaler.unscale_(self.optimizer)
-                        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                        grad_norm_val = grad_norm.item() if torch.isfinite(grad_norm) else 0.0
 
                         if not torch.isfinite(grad_norm):
                             logger.warning(f"[Batch {batch_idx}] Non-finite grad norm ({grad_norm:.2f}). Skipping batch.")
@@ -488,7 +493,8 @@ class EnglishTrainer:
                         # FP32 fallback (no mixed precision)
                         self.optimizer.zero_grad(set_to_none=True)
                         total_loss.backward()
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                        grad_norm_val = grad_norm.item() if torch.isfinite(grad_norm) else 0.0
                         self.optimizer.step()
 
                 # Cache loss values (single .item() call per loss - no duplicate GPU syncs)
@@ -518,6 +524,7 @@ class EnglishTrainer:
                         "train/batch_duration_loss": loss_dur_val,
                         "train/batch_stop_loss": loss_stop_val,
                         "train/learning_rate": self.optimizer.param_groups[0]['lr'],
+                        "train/grad_norm": grad_norm_val,  # Monitor gradient explosions
                         "epoch": epoch + 1,
                     }
 

@@ -132,19 +132,20 @@ class EnglishTrainingConfig:
     # Gradient clipping
     max_grad_norm: float = 1.0          # Maximum gradient norm for clipping
 
-    # Scheduled Sampling (CRITICAL for inference quality)
-    # Gradually exposes model to its own predictions during training to reduce exposure bias
-    # Without this, model trains with perfect inputs but fails at inference with imperfect predictions
-    # AT EPOCH 200+: Use VERY gentle sampling to avoid spikes while maintaining robustness
-    # The spikes were caused by TOO MUCH sampling (15%) when mel_loss was still high
-    enable_scheduled_sampling: bool = True  # KEEP ENABLED for inference quality
-    scheduled_sampling_warmup_batches: int = 12000  # Pure teacher forcing for first N batches (~30 epochs)
-    scheduled_sampling_max_prob: float = 0.05      # REDUCED from 0.15 to 0.05 (5% sampling only)
-    scheduled_sampling_zero_input_ratio: float = 0.05  # REDUCED from 0.1 to 0.05 (gentler)
-    # Schedule: 0-12000 batches: prob=0.0 (teacher forcing - let model learn basics)
-    #           12000-16000: prob=0.02 (ultra-gentle exposure)
-    #           16000-24000: prob=0.03 (very gentle exposure)
-    #           24000+: prob=0.05 (gentle exposure - prevents spikes while building robustness)
+    # Scheduled Sampling - DISABLED for stability
+    # ISSUE: Even gentle sampling (1.5%) caused catastrophic stop token failure at epoch 38
+    # - Stop loss exploded: 0.004 → 0.38 (95x increase) when sampling started
+    # - Gradients exploded silently (BF16 has no overflow warnings)
+    # - Stop token confusion cascaded to duration/mel predictors
+    # SOLUTION: Train with pure teacher forcing (100% stable, proven to work)
+    # - Inference quality will be tested after training converges to mel_loss ~0.2-0.3
+    # - Can fine-tune with very gentle sampling (0.5%) in later epochs if needed
+    enable_scheduled_sampling: bool = False  # DISABLED - caused training collapse
+    scheduled_sampling_warmup_batches: int = 999999  # Effectively never start
+    scheduled_sampling_max_prob: float = 0.0         # No sampling
+    scheduled_sampling_zero_input_ratio: float = 0.0 # No zero-input training
+    # Note: Pure teacher forcing is how most production TTS models train successfully
+    # FastSpeech, Tacotron 2, and Glow-TTS all use 100% teacher forcing
 
     # Ground Truth Durations (IMPORTANT for early training stability)
     # Using GT durations bypasses duration predictor, allowing mel predictor to learn faster
