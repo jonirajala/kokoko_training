@@ -107,20 +107,54 @@ class EnglishTrainer:
 
         # NOW create our English dataset
         logger.info("Loading English LJSpeech dataset...")
-        self.dataset = LJSpeechDataset(config.data_dir, config)
-        logger.info(f"Loaded {len(self.dataset)} samples")
+        full_dataset = LJSpeechDataset(config.data_dir, config)
+        logger.info(f"Loaded {len(full_dataset)} samples")
 
-        # Create batch sampler
+        # Split into train and validation
+        validation_split = getattr(config, 'validation_split', 0.05)
+        if validation_split > 0:
+            total_size = len(full_dataset)
+            val_size = int(total_size * validation_split)
+            train_size = total_size - val_size
+
+            # Use torch.utils.data.random_split for deterministic splitting
+            from torch.utils.data import random_split
+            generator = torch.Generator().manual_seed(42)  # Fixed seed for reproducibility
+            self.train_dataset, self.val_dataset = random_split(
+                full_dataset, [train_size, val_size], generator=generator
+            )
+            logger.info(f"Split dataset: {train_size} train, {val_size} validation")
+
+            # Validation dataloader (no batch sampler, just regular batching)
+            self.val_dataloader = DataLoader(
+                self.val_dataset,
+                batch_size=config.batch_size,
+                shuffle=False,  # Don't shuffle validation
+                collate_fn=collate_fn,
+                num_workers=getattr(config, 'num_workers', 2),
+                pin_memory=getattr(config, 'pin_memory', False) and self.device.type == DeviceType.CUDA.value,
+                drop_last=False  # Use all validation samples
+            )
+        else:
+            self.train_dataset = full_dataset
+            self.val_dataset = None
+            self.val_dataloader = None
+            logger.info("No validation split - using all data for training")
+
+        # Store full dataset reference for compatibility
+        self.dataset = full_dataset
+
+        # Create batch sampler for training
         self.batch_sampler = LengthBasedBatchSampler(
-            dataset=self.dataset,
+            dataset=self.train_dataset,
             batch_size=config.batch_size,
             drop_last=True,
             shuffle=True
         )
 
-        # Create dataloader
+        # Create training dataloader
         self.dataloader = DataLoader(
-            self.dataset,
+            self.train_dataset,
             batch_sampler=self.batch_sampler,
             collate_fn=collate_fn,
             num_workers=getattr(config, 'num_workers', 2),
@@ -213,6 +247,7 @@ class EnglishTrainer:
         # Training state
         self.start_epoch = 0
         self.best_loss = float('inf')
+        self.best_val_loss = float('inf')  # Track best validation loss
 
         # Stats
         self.mixed_precision_stats = {
@@ -694,6 +729,27 @@ class EnglishTrainer:
                     pct = (skipped_batches / total_batches) * 100
                     logger.info(f"Skipped {skipped_batches}/{total_batches} batches ({pct:.1f}%) due to NaN gradients (phoneme mismatches, padding samples)")
 
+                # Run validation
+                validate_every = getattr(self.config, 'validate_every', 1)
+                if self.val_dataloader is not None and (epoch + 1) % validate_every == 0:
+                    val_metrics = self.validate(epoch)
+
+                    # Log validation metrics to W&B
+                    if self.use_wandb and val_metrics:
+                        self.log_to_wandb(val_metrics, step=(epoch + 1) * len(self.dataloader), commit=True)
+
+                    # Track best validation loss
+                    if val_metrics:
+                        current_val_loss = val_metrics['val/total_loss']
+                        if current_val_loss < self.best_val_loss:
+                            self.best_val_loss = current_val_loss
+                            logger.info(f"✓ New best validation loss: {self.best_val_loss:.4f}")
+
+                            # Save best model checkpoint
+                            if getattr(self.config, 'save_best_only', False):
+                                self.save_checkpoint_with_scaler(epoch, current_val_loss, is_best=True)
+                                logger.info(f"Best model checkpoint saved for epoch {epoch+1}")
+
                 # Log memory management stats for this epoch
                 if self.enable_adaptive_memory:
                     memory_report = self.memory_manager.get_memory_report()
@@ -703,10 +759,13 @@ class EnglishTrainer:
                     logger.info(f"  Memory Trend: {memory_report['memory_trend']:+.2f}%")
                     logger.info(f"  Cleanup Overhead: {memory_report['cleanup_overhead_percent']:.2f}%")
 
+                # Save periodic checkpoints (if not using save_best_only)
                 if (epoch + 1) % self.config.save_every == 0:
-                    # save_checkpoint_with_scaler handles both FP16 (with scaler) and BF16/FP32 (without scaler)
-                    self.save_checkpoint_with_scaler(epoch, avg_total_loss)
-                    logger.info(f"Checkpoint saved for epoch {epoch+1}")
+                    save_best_only = getattr(self.config, 'save_best_only', False)
+                    if not save_best_only:
+                        # save_checkpoint_with_scaler handles both FP16 (with scaler) and BF16/FP32 (without scaler)
+                        self.save_checkpoint_with_scaler(epoch, avg_total_loss)
+                        logger.info(f"Checkpoint saved for epoch {epoch+1}")
 
                 # Strategic memory cleanup at epoch end
                 if self.enable_adaptive_memory:
@@ -861,6 +920,96 @@ class EnglishTrainer:
 
         return total_loss, loss_mel_coarse, loss_mel_refined, loss_duration, loss_stop_token
 
+    def validate(self, epoch: int) -> Dict[str, float]:
+        """
+        Run validation and return metrics.
+
+        Returns:
+            Dictionary with validation losses
+        """
+        if self.val_dataloader is None:
+            return {}
+
+        self.model.eval()
+
+        val_total_loss = 0.0
+        val_mel_coarse_loss = 0.0
+        val_mel_refined_loss = 0.0
+        val_duration_loss = 0.0
+        val_stop_loss = 0.0
+        val_batches = 0
+
+        logger.info(f"Running validation...")
+
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(self.val_dataloader):
+                try:
+                    phoneme_indices, mel_specs, phoneme_durations, stop_token_targets, mel_lengths, phoneme_lengths = batch
+
+                    # Move to device
+                    phoneme_indices = phoneme_indices.to(self.device)
+                    mel_specs = mel_specs.to(self.device)
+                    phoneme_durations = phoneme_durations.to(self.device)
+                    stop_token_targets = stop_token_targets.to(self.device)
+                    mel_lengths = mel_lengths.to(self.device)
+                    phoneme_lengths = phoneme_lengths.to(self.device)
+
+                    # Forward pass (no mixed precision for validation for stability)
+                    mel_coarse, mel_refined, predicted_log_durations, predicted_stop_logits = \
+                        self.model.forward_training(
+                            phoneme_indices=phoneme_indices,
+                            mel_specs=mel_specs,
+                            phoneme_durations=phoneme_durations,
+                            stop_token_targets=stop_token_targets,
+                            text_padding_mask=None,
+                            mel_padding_mask=None,
+                            use_gt_durations=False,
+                            decoder_input_mels=None  # Pure teacher forcing
+                        )
+
+                    # Calculate losses
+                    total_loss, loss_mel_coarse, loss_mel_refined, loss_duration, loss_stop_token = \
+                        self._calculate_losses(
+                            mel_coarse, mel_refined, predicted_log_durations, predicted_stop_logits,
+                            mel_specs, phoneme_durations, stop_token_targets,
+                            mel_lengths, phoneme_lengths
+                        )
+
+                    # Accumulate
+                    val_total_loss += total_loss.item()
+                    val_mel_coarse_loss += loss_mel_coarse.item()
+                    val_mel_refined_loss += loss_mel_refined.item()
+                    val_duration_loss += loss_duration.item()
+                    val_stop_loss += loss_stop_token.item()
+                    val_batches += 1
+
+                except Exception as e:
+                    logger.warning(f"Validation batch {batch_idx} failed: {e}")
+                    continue
+
+        # Compute averages
+        if val_batches > 0:
+            val_metrics = {
+                'val/total_loss': val_total_loss / val_batches,
+                'val/mel_coarse_loss': val_mel_coarse_loss / val_batches,
+                'val/mel_refined_loss': val_mel_refined_loss / val_batches,
+                'val/mel_combined_loss': (val_mel_coarse_loss + val_mel_refined_loss) / (2 * val_batches),
+                'val/duration_loss': val_duration_loss / val_batches,
+                'val/stop_loss': val_stop_loss / val_batches,
+            }
+
+            logger.info(f"Validation - Epoch {epoch}: "
+                       f"total={val_metrics['val/total_loss']:.4f}, "
+                       f"mel_refined={val_metrics['val/mel_refined_loss']:.4f}, "
+                       f"mel_coarse={val_metrics['val/mel_coarse_loss']:.4f}, "
+                       f"dur={val_metrics['val/duration_loss']:.4f}, "
+                       f"stop={val_metrics['val/stop_loss']:.4f}")
+        else:
+            val_metrics = {}
+
+        self.model.train()
+        return val_metrics
+
     def setup_checkpoint_resumption(self):
         """Handle checkpoint resumption with mixed precision state"""
 
@@ -900,7 +1049,7 @@ class EnglishTrainer:
         self.dataset.phoneme_processor = phoneme_processor
         logger.info(f"Resumed from epoch {self.start_epoch}, best loss {self.best_loss:.4f}")
 
-    def save_checkpoint_with_scaler(self, epoch: int, loss: float):
+    def save_checkpoint_with_scaler(self, epoch: int, loss: float, is_best: bool = False):
         """Save checkpoint including scaler state with disk space check and cleanup"""
 
         # Check disk space before saving
@@ -914,6 +1063,7 @@ class EnglishTrainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'loss': loss,
+            'best_val_loss': self.best_val_loss,  # Save best validation loss
             'config': self.config,
         }
 
@@ -922,16 +1072,21 @@ class EnglishTrainer:
             checkpoint['scaler'] = self.scaler.state_dict()
             checkpoint['device_type'] = self.device_type  # Store device type for proper restoration
 
-        checkpoint_path = os.path.join(self.config.output_dir, f'checkpoint_epoch_{epoch+1}.pth')
+        # Use different filename for best model
+        if is_best:
+            checkpoint_path = os.path.join(self.config.output_dir, 'checkpoint_best.pth')
+        else:
+            checkpoint_path = os.path.join(self.config.output_dir, f'checkpoint_epoch_{epoch+1}.pth')
 
         try:
             torch.save(checkpoint, checkpoint_path)
             logger.info(f"Checkpoint saved to {checkpoint_path}")
 
-            # Cleanup old checkpoints if configured
-            keep_last_n = getattr(self.config, 'keep_last_n_checkpoints', 3)
-            if keep_last_n > 0:
-                cleanup_old_checkpoints(self.config.output_dir, keep_last_n)
+            # Cleanup old checkpoints if configured (never delete best checkpoint)
+            if not is_best:
+                keep_last_n = getattr(self.config, 'keep_last_n_checkpoints', 3)
+                if keep_last_n > 0:
+                    cleanup_old_checkpoints(self.config.output_dir, keep_last_n)
         except Exception as e:
             logger.error(f"Failed to save checkpoint: {e}")
             logger.error("Training will continue without this checkpoint")

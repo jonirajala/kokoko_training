@@ -19,8 +19,13 @@ class EnglishTrainingConfig:
     # Basic training parameters
     num_epochs: int = 300  # Extended for full convergence
     batch_size: int = 32        # Optimal for RTX 4090 with BF16
-    learning_rate: float = 1e-3 # Increased from 1e-4 to escape plateau at epoch 200 
+    learning_rate: float = 1e-3 # Increased from 1e-4 to escape plateau at epoch 200
     device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+
+    # Validation split
+    validation_split: float = 0.05  # 5% of data for validation (~650 samples from LJSpeech)
+    validate_every: int = 1         # Run validation every N epochs
+    save_best_only: bool = True     # Only save checkpoints that improve validation loss
 
     # Learning Rate Reasoning (batch=32, BF16):
     # - Base LJSpeech LR: 4e-5 (batch=16, FP32)
@@ -67,11 +72,12 @@ class EnglishTrainingConfig:
     encoder_dropout: float = 0.1        # Dropout rate
     max_decoder_seq_len: int = 4000     # Maximum decoder sequence length
 
-    # Loss weights (FIXED: gradient imbalance caused by duration_loss_weight=1.0)
-    # Overfit test proved 0.01 works perfectly - mel loss 0.016, perfect audio
-    # REDUCED: At epoch 200+, focus more on mel quality, less on duration accuracy
-    duration_loss_weight: float = 0.005  # Reduced from 0.01 to focus on mel quality
-    stop_token_loss_weight: float = 0.1 # Weight for stop token loss
+    # Loss weights (BALANCED for all components)
+    # Duration predictor MUST learn properly - wrong durations = garbage audio even with good mels
+    # Testing showed 0.005 is TOO SMALL - duration loss stuck at 0.323 after 300 epochs
+    # Increasing to 0.05 gives duration predictor proper gradient signal
+    duration_loss_weight: float = 0.05   # Increased from 0.005 - duration critical for quality
+    stop_token_loss_weight: float = 0.1  # Weight for stop token loss
 
     # Dual Mel Loss Weights (Tacotron 2 architecture)
     # L_mel = α * L(mel_coarse, target) + β * L(mel_refined, target)

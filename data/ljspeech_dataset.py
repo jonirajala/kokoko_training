@@ -501,11 +501,24 @@ class LengthBasedBatchSampler(Sampler):
 
     def _get_lengths(self) -> List[int]:
         """Get approximate length for each sample"""
-        lengths = []
-        for sample in tqdm(self.dataset.samples, desc="Calculating lengths"):
-            # Use text length as proxy (faster than loading audio)
-            text_len = len(sample['text'])
-            lengths.append(text_len)
+        from torch.utils.data import Subset
+
+        # Handle both regular Dataset and Subset (from train/val split)
+        if isinstance(self.dataset, Subset):
+            # For Subset, access underlying dataset and filter by indices
+            underlying_dataset = self.dataset.dataset
+            subset_indices = self.dataset.indices
+            lengths = []
+            for idx in tqdm(subset_indices, desc="Calculating lengths"):
+                sample = underlying_dataset.samples[idx]
+                text_len = len(sample['text'])
+                lengths.append(text_len)
+        else:
+            # Regular dataset
+            lengths = []
+            for sample in tqdm(self.dataset.samples, desc="Calculating lengths"):
+                text_len = len(sample['text'])
+                lengths.append(text_len)
         return lengths
 
     def __iter__(self):

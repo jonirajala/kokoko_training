@@ -766,7 +766,8 @@ class KokoroModel(nn.Module):
                         # It needs full sequence context to work properly
                         with torch.profiler.record_function("inference_postnet"):
                             mel_residual = self.postnet(mel_coarse_sequence)
-                            mel_output = mel_coarse_sequence + 0.5 * mel_residual
+                            # CRITICAL: Must match training! Training uses full residual (1.0x)
+                            mel_output = mel_coarse_sequence + mel_residual  # Fixed from 0.5x to 1.0x
 
                             # Final clamp to vocoder range
                             mel_output = torch.clamp(mel_output, min=-11.5, max=0.0)
