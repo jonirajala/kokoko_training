@@ -338,7 +338,13 @@ class EnglishTrainer:
             # Watch model
             wandb.watch(self.model, log="all", log_freq=100)
 
+            # Define metrics for proper chart grouping
+            wandb.define_metric("epoch")
+            wandb.define_metric("train/*", step_metric="epoch")
+            wandb.define_metric("val/*", step_metric="epoch")
+
             logger.info(f"W&B initialized: {self.wandb_run.url}")
+            logger.info("W&B metrics defined for train/* and val/* grouping")
 
         except Exception as e:
             logger.error(f"Failed to initialize W&B: {e}")
@@ -351,7 +357,11 @@ class EnglishTrainer:
             return
 
         try:
-            wandb.log(metrics, step=step, commit=commit)
+            if step is not None:
+                wandb.log(metrics, step=step, commit=commit)
+            else:
+                # Let W&B use the step_metric defined in wandb.define_metric()
+                wandb.log(metrics, commit=commit)
         except Exception as e:
             logger.warning(f"Failed to log to W&B: {e}")
 
@@ -607,7 +617,8 @@ class EnglishTrainer:
                         wandb_metrics["train/grad_scale"] = self.scaler.get_scale()
 
                     # commit=False prevents blocking on network I/O
-                    self.log_to_wandb(wandb_metrics, step=global_step, commit=False)
+                    # Don't specify step - W&B will use 'epoch' from metrics dict
+                    self.log_to_wandb(wandb_metrics, commit=False)
 
                 # Update progress bar using cached values
                 # Show refined mel loss (final quality) and coarse (decoder quality)
@@ -675,7 +686,8 @@ class EnglishTrainer:
                 })
 
             # commit=True at epoch end to flush any pending logs
-            self.log_to_wandb(wandb_metrics, step=base_global_step + num_batches, commit=True)
+            # Don't specify step - W&B will use 'epoch' from metrics dict
+            self.log_to_wandb(wandb_metrics, commit=True)
 
         # Cleanup profiler if it was started
         if self.profiler:
@@ -773,9 +785,10 @@ class EnglishTrainer:
                 if self.val_dataloader is not None and (epoch + 1) % validate_every == 0:
                     val_metrics = self.validate(epoch)
 
-                    # Log validation metrics to W&B
+                    # Log validation metrics to W&B with epoch number
                     if self.use_wandb and val_metrics:
-                        self.log_to_wandb(val_metrics, step=(epoch + 1) * len(self.dataloader), commit=True)
+                        val_metrics['epoch'] = epoch + 1  # Add epoch for step_metric
+                        self.log_to_wandb(val_metrics, commit=True)
 
                     # Track best validation loss
                     if val_metrics:
