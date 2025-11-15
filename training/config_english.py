@@ -19,7 +19,7 @@ class EnglishTrainingConfig:
     # Basic training parameters
     num_epochs: int = 300  # Extended for full convergence
     batch_size: int = 32        # Optimal for RTX 4090 with BF16
-    learning_rate: float = 1e-3 # Increased from 1e-4 to escape plateau at epoch 200
+    learning_rate: float = 1e-3 # Keep at 1e-3 - gradient explosion protection handles instability
     device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
     # Validation split
@@ -74,9 +74,9 @@ class EnglishTrainingConfig:
 
     # Loss weights (BALANCED for all components)
     # Duration predictor MUST learn properly - wrong durations = garbage audio even with good mels
-    # Testing showed 0.005 is TOO SMALL - duration loss stuck at 0.323 after 300 epochs
-    # Increasing to 0.05 gives duration predictor proper gradient signal
-    duration_loss_weight: float = 0.05   # Increased from 0.005 - duration critical for quality
+    # Testing showed 0.005 is TOO SMALL (stuck at 0.323), but 0.05 is TOO HIGH (gradient explosions)
+    # Sweet spot: 0.02 provides sufficient signal without instability
+    duration_loss_weight: float = 0.02   # Balanced - not too weak (0.005) nor too strong (0.05)
     stop_token_loss_weight: float = 0.1  # Weight for stop token loss
 
     # Dual Mel Loss Weights (Tacotron 2 architecture)

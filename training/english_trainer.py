@@ -488,11 +488,22 @@ class EnglishTrainer:
                         grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
                         grad_norm_val = grad_norm.item() if torch.isfinite(grad_norm) else 0.0
 
+                        # Check for gradient explosion BEFORE clipping corrupts direction
                         if not torch.isfinite(grad_norm):
-                            logger.warning(f"[Batch {batch_idx}] Non-finite grad norm ({grad_norm:.2f}). Skipping batch.")
+                            logger.warning(f"[Batch {batch_idx}] Non-finite grad norm. Skipping batch.")
                             self.optimizer.zero_grad(set_to_none=True)
                             skipped_batches += 1
                             continue
+
+                        # CRITICAL: Skip batch if gradients exploded (prevents weight corruption)
+                        if grad_norm_val > 10.0:
+                            logger.warning(f"[Batch {batch_idx}] Gradient explosion detected! "
+                                         f"grad_norm={grad_norm_val:.2f} > 10.0. Skipping batch to prevent model corruption.")
+                            self.optimizer.zero_grad(set_to_none=True)
+                            skipped_batches += 1
+                            continue
+                        elif grad_norm_val > 5.0:
+                            logger.warning(f"[Batch {batch_idx}] High gradient norm: {grad_norm_val:.2f}")
 
                         self.optimizer.step()
 
@@ -504,11 +515,22 @@ class EnglishTrainer:
                         grad_norm_val = grad_norm.item() if torch.isfinite(grad_norm) else 0.0
 
                         if not torch.isfinite(grad_norm):
-                            logger.warning(f"[Batch {batch_idx}] Non-finite grad norm ({grad_norm:.2f}). Skipping batch.")
+                            logger.warning(f"[Batch {batch_idx}] Non-finite grad norm. Skipping batch.")
                             self.optimizer.zero_grad(set_to_none=True)
                             skipped_batches += 1
                             self.scaler.update()
                             continue
+
+                        # CRITICAL: Skip batch if gradients exploded (prevents weight corruption)
+                        if grad_norm_val > 10.0:
+                            logger.warning(f"[Batch {batch_idx}] Gradient explosion detected! "
+                                         f"grad_norm={grad_norm_val:.2f} > 10.0. Skipping batch to prevent model corruption.")
+                            self.optimizer.zero_grad(set_to_none=True)
+                            skipped_batches += 1
+                            self.scaler.update()
+                            continue
+                        elif grad_norm_val > 5.0:
+                            logger.warning(f"[Batch {batch_idx}] High gradient norm: {grad_norm_val:.2f}")
 
                         self.scaler.step(self.optimizer)
                         old_scale = self.scaler.get_scale()
@@ -530,6 +552,23 @@ class EnglishTrainer:
                         total_loss.backward()
                         grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
                         grad_norm_val = grad_norm.item() if torch.isfinite(grad_norm) else 0.0
+
+                        if not torch.isfinite(grad_norm):
+                            logger.warning(f"[Batch {batch_idx}] Non-finite grad norm. Skipping batch.")
+                            self.optimizer.zero_grad(set_to_none=True)
+                            skipped_batches += 1
+                            continue
+
+                        # CRITICAL: Skip batch if gradients exploded (prevents weight corruption)
+                        if grad_norm_val > 10.0:
+                            logger.warning(f"[Batch {batch_idx}] Gradient explosion detected! "
+                                         f"grad_norm={grad_norm_val:.2f} > 10.0. Skipping batch to prevent model corruption.")
+                            self.optimizer.zero_grad(set_to_none=True)
+                            skipped_batches += 1
+                            continue
+                        elif grad_norm_val > 5.0:
+                            logger.warning(f"[Batch {batch_idx}] High gradient norm: {grad_norm_val:.2f}")
+
                         self.optimizer.step()
 
                 # Cache loss values (single .item() call per loss - no duplicate GPU syncs)
@@ -944,15 +983,14 @@ class EnglishTrainer:
         with torch.no_grad():
             for batch_idx, batch in enumerate(self.val_dataloader):
                 try:
-                    phoneme_indices, mel_specs, phoneme_durations, stop_token_targets, mel_lengths, phoneme_lengths = batch
-
-                    # Move to device
-                    phoneme_indices = phoneme_indices.to(self.device)
-                    mel_specs = mel_specs.to(self.device)
-                    phoneme_durations = phoneme_durations.to(self.device)
-                    stop_token_targets = stop_token_targets.to(self.device)
-                    mel_lengths = mel_lengths.to(self.device)
-                    phoneme_lengths = phoneme_lengths.to(self.device)
+                    # Access batch as dictionary (matching training loop)
+                    non_blocking = self.device.type == 'cuda'
+                    phoneme_indices = batch['phoneme_indices'].to(self.device, non_blocking=non_blocking)
+                    mel_specs = batch['mel_specs'].to(self.device, non_blocking=non_blocking)
+                    phoneme_durations = batch['phoneme_durations'].to(self.device, non_blocking=non_blocking)
+                    stop_token_targets = batch['stop_token_targets'].to(self.device, non_blocking=non_blocking)
+                    mel_lengths = batch['mel_lengths'].to(self.device, non_blocking=non_blocking)
+                    phoneme_lengths = batch['phoneme_lengths'].to(self.device, non_blocking=non_blocking)
 
                     # Forward pass (no mixed precision for validation for stability)
                     mel_coarse, mel_refined, predicted_log_durations, predicted_stop_logits = \
